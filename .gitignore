@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.py[o]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dml.out
+*.log
+*.logl
+*.db
+*.sqlite
+*.sqlite3
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.DS_Store?
+Thumbs.db
+*.sublime-*
+
+
+# Project specific
+ds_sandbox.egg-info/
