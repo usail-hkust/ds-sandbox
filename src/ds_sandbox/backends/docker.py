@@ -112,6 +112,7 @@ class DockerSandbox(SandboxBackend):
                 cpu_cores=cpu_cores,
                 network_policy=request.network_policy,
                 network_whitelist=request.network_whitelist,
+                allow_internet=request.allow_internet,
                 env_vars=request.env_vars
             )
 
@@ -276,6 +277,7 @@ class DockerSandbox(SandboxBackend):
         cpu_cores: float,
         network_policy: str,
         network_whitelist: list,
+        allow_internet: bool = True,
         env_vars: Optional[Dict[str, str]] = None
     ) -> Container:
         """
@@ -285,7 +287,9 @@ class DockerSandbox(SandboxBackend):
             workspace: Workspace information
             memory_mb: Memory limit in MB
             cpu_cores: CPU cores limit
-            network_disabled: Whether to disable network
+            network_policy: Network policy (allow/deny/whitelist)
+            network_whitelist: List of allowed domains/IPs
+            allow_internet: Whether to allow internet access
             env_vars: Environment variables
 
         Returns:
@@ -310,7 +314,8 @@ class DockerSandbox(SandboxBackend):
         # Determine network configuration based on policy
         network_mode, extra_hosts = self._configure_network(
             network_policy=network_policy,
-            network_whitelist=network_whitelist
+            network_whitelist=network_whitelist,
+            allow_internet=allow_internet
         )
 
         # Container configuration
@@ -376,22 +381,29 @@ class DockerSandbox(SandboxBackend):
     def _configure_network(
         self,
         network_policy: str,
-        network_whitelist: list
+        network_whitelist: list,
+        allow_internet: bool = True
     ) -> tuple:
         """
         Configure Docker network based on policy.
 
         Args:
-            network_policy: Network policy (disabled, whitelist, proxy)
+            network_policy: Network policy (allow, deny, whitelist)
             network_whitelist: List of allowed hostnames/IPs
+            allow_internet: Whether to allow internet access
 
         Returns:
             Tuple of (network_mode, extra_hosts)
             - network_mode: Docker network name or None for network_disabled
             - extra_hosts: List of host:IP mappings or None
         """
-        if network_policy == "disabled":
-            # Disable network entirely - return None to trigger network_disabled
+        # Check allow_internet first
+        if not allow_internet:
+            # Internet is disabled entirely
+            return (None, None)
+
+        if network_policy == "deny":
+            # Explicitly deny network access
             return (None, None)
 
         if network_policy == "whitelist":
@@ -414,12 +426,7 @@ class DockerSandbox(SandboxBackend):
             # Use bridge network with extra_hosts for whitelist
             return ("bridge", extra_hosts)
 
-        if network_policy == "proxy":
-            # Proxy mode uses HTTP_PROXY environment variables
-            # The container will route through the configured proxy
-            return ("bridge", None)
-
-        # Default to bridge network
+        # Default to "allow" - use bridge network
         return ("bridge", None)
 
     async def _run_code_in_container(

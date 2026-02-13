@@ -19,6 +19,7 @@ __all__ = [
     "SandboxEvent",
     "PausedWorkspace",
     "SandboxMetrics",
+    "StorageConfig",
 ]
 
 
@@ -73,8 +74,13 @@ class ExecuteCodeRequest(BaseModel):
     )
 
     # Security configuration
-    network_policy: Literal["disabled", "whitelist", "proxy"] = Field(
-        default="disabled",
+    allow_internet: bool = Field(
+        default=True,
+        description="Whether to allow internet access"
+    )
+
+    network_policy: Literal["allow", "deny", "whitelist"] = Field(
+        default="allow",
         description="Network access policy"
     )
 
@@ -148,8 +154,13 @@ class ExecutionRequest(BaseModel):
     )
 
     # Security configuration
-    network_policy: Literal["disabled", "whitelist", "proxy"] = Field(
-        default="disabled",
+    allow_internet: bool = Field(
+        default=True,
+        description="Whether to allow internet access"
+    )
+
+    network_policy: Literal["allow", "deny", "whitelist"] = Field(
+        default="allow",
         description="Network access policy"
     )
 
@@ -226,6 +237,11 @@ class Workspace(BaseModel):
     created_at: str = Field(..., description="Creation timestamp (ISO 8601)")
 
     last_used_at: Optional[str] = Field(None, description="Last used timestamp")
+
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Custom metadata for the sandbox"
+    )
 
 
 class DatasetInfo(BaseModel):
@@ -546,4 +562,55 @@ class SandboxMetrics(BaseModel):
     mem_used_mib: int = Field(..., description="Used memory in MiB")
 
     timestamp: str = Field(..., description="ISO 8601 timestamp of the metrics snapshot")
+
+
+class StorageConfig(BaseModel):
+    """
+    Storage bucket configuration.
+
+    This model defines the configuration for mounting cloud storage (S3, GCS, Azure)
+    to a sandbox workspace.
+
+    Example:
+        >>> config = StorageConfig(
+        ...     provider="s3",
+        ...     bucket="my-data-bucket",
+        ...     region="us-east-1",
+        ...     path_prefix="data/",
+        ...     credentials={"access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}
+        ... )
+    """
+
+    provider: Literal["s3", "gcs", "azure", "local"] = Field(
+        ...,
+        description="Storage provider: s3 (AWS S3), gcs (Google Cloud Storage), azure (Azure Blob Storage), local (local filesystem)"
+    )
+
+    bucket: str = Field(..., description="Bucket name or container name")
+
+    region: Optional[str] = Field(
+        None,
+        description="Region for S3 buckets (e.g., us-east-1, eu-west-1)"
+    )
+
+    path_prefix: Optional[str] = Field(
+        None,
+        description="Path prefix within the bucket to mount"
+    )
+
+    credentials: Optional[Dict[str, str]] = Field(
+        None,
+        description="Credentials for accessing the storage. For S3: access_key_id, secret_access_key. For GCS: service_account_key. For Azure: account_name, account_key"
+    )
+
+    # Mount options
+    read_only: bool = Field(
+        default=False,
+        description="Whether to mount storage as read-only"
+    )
+
+    mount_point: Optional[str] = Field(
+        None,
+        description="Target mount point within the workspace (default: /workspace/storage/<bucket_name>)"
+    )
 

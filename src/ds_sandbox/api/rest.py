@@ -27,6 +27,7 @@ from ds_sandbox.types import (
     PausedWorkspace,
     SandboxMetrics,
     Template,
+    StorageConfig,
 )
 from ds_sandbox.errors import (
     SandboxError,
@@ -60,6 +61,10 @@ class CreateWorkspaceRequest(BaseModel):
         default_factory=lambda: ["data", "models", "outputs"],
         description="Additional subdirectories to create"
     )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Custom metadata for the sandbox"
+    )
 
 
 class PrepareDatasetsRequest(BaseModel):
@@ -72,6 +77,33 @@ class PrepareDatasetsRequest(BaseModel):
     strategy: str = Field(
         default="copy",
         description="Preparation strategy: copy or link"
+    )
+
+
+class MountStorageRequest(BaseModel):
+    """Request to mount storage to a workspace"""
+    storage_config: StorageConfig = Field(..., description="Storage configuration")
+    mount_name: Optional[str] = Field(
+        None,
+        description="Optional name for this mount (defaults to bucket name)"
+    )
+
+
+class StorageMountResponse(BaseModel):
+    """Storage mount response"""
+    mount_name: str = Field(..., description="Mount name")
+    provider: str = Field(..., description="Storage provider")
+    bucket: str = Field(..., description="Bucket name")
+    mount_point: str = Field(..., description="Mount point in workspace")
+    path_prefix: Optional[str] = Field(None, description="Path prefix in bucket")
+    read_only: bool = Field(..., description="Whether mount is read-only")
+
+
+class StorageMountListResponse(BaseModel):
+    """Storage mount list response"""
+    mounts: List[StorageMountResponse] = Field(
+        default_factory=list,
+        description="List of storage mounts"
     )
 
 
@@ -431,6 +463,7 @@ def register_routes(app: FastAPI) -> None:
         workspace = await manager.create_workspace(
             workspace_id=request.workspace_id,
             setup_dirs=request.setup_dirs,
+            metadata=request.metadata,
         )
 
         logger.info(f"Workspace created: {workspace.workspace_id}")
@@ -750,6 +783,112 @@ def register_routes(app: FastAPI) -> None:
             dataset_registry=manager.config.dataset_registry_dir,
         )
         return await workspace_service.list_workspace_datasets(workspace_id)
+
+    # =========================================================================
+    # Storage Management
+    # =========================================================================
+
+    @app.post(
+        "/v1/workspaces/{workspace_id}/storage",
+        response_model=StorageMountResponse,
+        tags=["Storage"]
+    )
+    async def mount_storage(
+        workspace_id: str,
+        request: MountStorageRequest,
+        manager=Depends(get_manager)
+    ):
+        """
+        Mount storage to a workspace
+
+        Mounts cloud storage (S3, GCS, Azure) to a workspace, making it
+        accessible from within the sandbox.
+        """
+        logger.info(
+            f"Mounting storage to workspace: {workspace_id}, "
+            f"bucket: {request.storage_config.bucket}"
+        )
+
+        # Validate workspace exists
+        await manager.get_workspace(workspace_id)
+
+        # Mount storage through manager
+        result = await manager.mount_storage(
+            workspace_id=workspace_id,
+            storage_config=request.storage_config,
+            mount_name=request.mount_name,
+        )
+
+        return StorageMountResponse(**result)
+
+    @app.get(
+        "/v1/workspaces/{workspace_id}/storage",
+        response_model=StorageMountListResponse,
+        tags=["Storage"]
+    )
+    async def list_storage_mounts(
+        workspace_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        List storage mounts for a workspace
+
+        Returns all storage mounts configured for a workspace.
+        """
+        logger.info(f"Listing storage mounts for workspace: {workspace_id}")
+
+        # Validate workspace exists
+        await manager.get_workspace(workspace_id)
+
+        mounts = await manager.list_storage_mounts(workspace_id)
+        return StorageMountListResponse(
+            mounts=[StorageMountResponse(**m) for m in mounts]
+        )
+
+    @app.get(
+        "/v1/workspaces/{workspace_id}/storage/{mount_name}",
+        response_model=StorageMountResponse,
+        tags=["Storage"]
+    )
+    async def get_storage_mount(
+        workspace_id: str,
+        mount_name: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Get storage mount for a workspace
+
+        Returns configuration for a specific storage mount.
+        """
+        logger.info(f"Getting storage mount '{mount_name}' for workspace: {workspace_id}")
+
+        # Validate mount_name
+        validate_path_component(mount_name, "mount_name")
+
+        result = await manager.get_storage_mount(workspace_id, mount_name)
+        return StorageMountResponse(**result)
+
+    @app.delete(
+        "/v1/workspaces/{workspace_id}/storage/{mount_name}",
+        tags=["Storage"]
+    )
+    async def unmount_storage(
+        workspace_id: str,
+        mount_name: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Unmount storage from a workspace
+
+        Removes a storage mount from a workspace.
+        """
+        logger.info(f"Unmounting storage '{mount_name}' from workspace: {workspace_id}")
+
+        # Validate mount_name
+        validate_path_component(mount_name, "mount_name")
+
+        result = await manager.unmount_storage(workspace_id, mount_name)
+        return result
 
     # =========================================================================
     # Template Management

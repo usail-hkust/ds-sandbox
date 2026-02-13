@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+from ds_sandbox.types import StorageConfig
 
 
 class SandboxConfig(BaseModel):
@@ -75,9 +77,19 @@ class SandboxConfig(BaseModel):
     )
 
     # Security defaults
+    allow_internet: bool = Field(
+        default=True,
+        description="Whether to allow internet access by default"
+    )
+
     default_network_policy: str = Field(
-        default="disabled",
-        description="Default network access policy (disabled/whitelist/proxy)"
+        default="allow",
+        description="Default network access policy (allow/deny/whitelist)"
+    )
+
+    network_whitelist: List[str] = Field(
+        default_factory=list,
+        description="Default network whitelist (domains/IPs allowed when network_policy=whitelist)"
     )
 
     default_timeout_sec: int = Field(
@@ -160,6 +172,18 @@ class SandboxConfig(BaseModel):
         description="Directory containing template configurations"
     )
 
+    # Storage configuration
+    storage_mounts: Dict[str, StorageConfig] = Field(
+        default_factory=dict,
+        description="Storage bucket configurations (mount_name -> StorageConfig)"
+    )
+
+    # Default storage mount base directory
+    storage_base_dir: str = Field(
+        default="/workspace/storage",
+        description="Base directory for mounting storage buckets in workspaces"
+    )
+
     @classmethod
     def load_template(cls, template_id: str, templates_dir: Optional[str] = None) -> Optional["Template"]:
         """
@@ -238,7 +262,9 @@ class SandboxConfig(BaseModel):
         - SANDBOX_DATASET_DIR: Dataset registry directory
         - SANDBOX_TIMEOUT: Default timeout in seconds
         - SANDBOX_MEMORY_MB: Default memory limit
-        - SANDBOX_NETWORK_POLICY: Network policy (disabled/whitelist/proxy)
+        - SANDBOX_NETWORK_POLICY: Network policy (allow/deny/whitelist)
+        - SANDBOX_ALLOW_INTERNET: Allow internet access (true/false)
+        - SANDBOX_NETWORK_WHITELIST: Comma-separated list of allowed domains/IPs
         - SANDBOX_ENABLE_GPU: Enable GPU (false)
         """
         import os
@@ -266,6 +292,11 @@ class SandboxConfig(BaseModel):
             kwargs["default_memory_mb"] = int(os.environ["SANDBOX_MEMORY_MB"])
         if "SANDBOX_NETWORK_POLICY" in os.environ:
             kwargs["default_network_policy"] = os.environ["SANDBOX_NETWORK_POLICY"]
+        if "SANDBOX_ALLOW_INTERNET" in os.environ:
+            kwargs["allow_internet"] = os.environ["SANDBOX_ALLOW_INTERNET"].lower() == "true"
+        if "SANDBOX_NETWORK_WHITELIST" in os.environ:
+            whitelist = os.environ["SANDBOX_NETWORK_WHITELIST"]
+            kwargs["network_whitelist"] = [item.strip() for item in whitelist.split(",") if item.strip()]
         if "SANDBOX_ENABLE_GPU" in os.environ:
             kwargs["enable_gpu_by_default"] = os.environ["SANDBOX_ENABLE_GPU"].lower() == "true"
 

@@ -446,6 +446,179 @@ class Commands:
                 stderr=f"Command timed out after {timeout}s",
             )
 
+    def run_streaming(
+        self,
+        cmd: str,
+        timeout: int = 60,
+        on_stdout: Optional[Callable[[str], None]] = None,
+        on_stderr: Optional[Callable[[str], None]] = None,
+    ) -> "CommandResult":
+        """Run a command with streaming output.
+
+        Args:
+            cmd: Command to execute
+            timeout: Timeout in seconds
+            on_stdout: Callback for each stdout line
+            on_stderr: Callback for each stderr line
+
+        Returns:
+            CommandResult with final stdout/stderr
+        """
+        return asyncio.run(self._run_streaming_async(cmd, timeout, on_stdout, on_stderr))
+
+    async def _run_streaming_async(
+        self,
+        cmd: str,
+        timeout: int,
+        on_stdout: Optional[Callable[[str], None]],
+        on_stderr: Optional[Callable[[str], None]],
+    ) -> "CommandResult":
+        """Run command with streaming output asynchronously."""
+        import subprocess
+        import threading
+
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        stdout_lines = []
+        stderr_lines = []
+        stdout_lock = threading.Lock()
+        stderr_lock = threading.Lock()
+        process = None
+
+        def read_stdout(proc):
+            """Read from stdout in a separate thread."""
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ''):
+                    if line:
+                        line = line.rstrip('\n')
+                        with stdout_lock:
+                            stdout_lines.append(line)
+                        if on_stdout:
+                            on_stdout(line)
+
+        def read_stderr(proc):
+            """Read from stderr in a separate thread."""
+            if proc.stderr:
+                for line in iter(proc.stderr.readline, ''):
+                    if line:
+                        line = line.rstrip('\n')
+                        with stderr_lock:
+                            stderr_lines.append(line)
+                        if on_stderr:
+                            on_stderr(line)
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=workspace.host_path,
+                env={**__import__('os').environ, 'PATH': __import__('os').environ.get('PATH', '')},
+            )
+
+            # Start threads to read stdout and stderr
+            stdout_thread = threading.Thread(target=read_stdout, args=(process,), daemon=True)
+            stderr_thread = threading.Thread(target=read_stderr, args=(process,), daemon=True)
+
+            stdout_thread.start()
+            stderr_thread.start()
+
+            # Wait for process to complete with timeout
+            try:
+                return_code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                return CommandResult(
+                    exit_code=-1,
+                    stdout='\n'.join(stdout_lines),
+                    stderr=f"Command timed out after {timeout}s",
+                )
+
+            # Wait for reader threads to finish
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+
+            return CommandResult(
+                exit_code=return_code,
+                stdout='\n'.join(stdout_lines),
+                stderr='\n'.join(stderr_lines),
+            )
+
+        except Exception as e:
+            return CommandResult(
+                exit_code=-1,
+                stdout='\n'.join(stdout_lines),
+                stderr=f"Error running command: {str(e)}",
+            )
+
+    def start(
+        self,
+        cmd: str,
+        env: Optional[Dict[str, str]] = None,
+    ) -> "Process":
+        """Start a command in the background.
+
+        Args:
+            cmd: Command to execute
+            env: Environment variables
+
+        Returns:
+            Process object with pid and methods to interact
+        """
+        return asyncio.run(self._start_async(cmd, env))
+
+    async def _start_async(
+        self,
+        cmd: str,
+        env: Optional[Dict[str, str]] = None,
+    ) -> "Process":
+        """Start a command in the background asynchronously.
+
+        Args:
+            cmd: Command to execute
+            env: Environment variables
+
+        Returns:
+            Process object with pid and methods to interact
+        """
+        import subprocess
+        import os
+
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        # Build environment
+        process_env = os.environ.copy()
+        if env:
+            process_env.update(env)
+        process_env['PATH'] = os.environ.get('PATH', '')
+
+        # Start the process
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=workspace.host_path,
+            env=process_env,
+            start_new_session=True,  # Detach process from parent
+        )
+
+        logger.debug(f"Started background process with PID: {process.pid}")
+
+        return Process(
+            pid=process.pid,
+            process=process,
+            workspace_path=workspace.host_path,
+        )
+
 
 class CommandResult:
     """Result of a command execution (E2B-compatible)."""
@@ -459,6 +632,71 @@ class CommandResult:
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+
+
+class Process:
+    """A running process in the sandbox."""
+
+    def __init__(self, pid: int, process: Any, workspace_path: str):
+        """Initialize the Process object.
+
+        Args:
+            pid: Process ID
+            process: The subprocess.Popen object
+            workspace_path: Path to the workspace directory
+        """
+        self.pid = pid
+        self._process = process
+        self._workspace_path = workspace_path
+        self._exit_code: Optional[int] = None
+
+    def is_running(self) -> bool:
+        """Check if process is still running.
+
+        Returns:
+            True if the process is still running, False otherwise
+        """
+        if self._process is None:
+            return False
+        return self._process.poll() is None
+
+    def wait(self, timeout: Optional[int] = None) -> int:
+        """Wait for process to complete, return exit code.
+
+        Args:
+            timeout: Optional timeout in seconds
+
+        Returns:
+            Exit code of the process
+
+        Raises:
+            subprocess.TimeoutExpired: If timeout is exceeded
+        """
+        if self._process is None:
+            return self._exit_code if self._exit_code is not None else -1
+
+        self._exit_code = self._process.wait(timeout=timeout)
+        return self._exit_code
+
+    def kill(self) -> None:
+        """Kill the process."""
+        if self._process is not None and self.is_running():
+            self._process.kill()
+            self._process.wait()
+            self._exit_code = self._process.returncode
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        """Get exit code if process has completed.
+
+        Returns:
+            Exit code if process has completed, None otherwise
+        """
+        if self._process is None:
+            return self._exit_code
+        if self.is_running():
+            return None
+        return self._process.returncode
 
 
 class CodeResult:
@@ -730,6 +968,7 @@ class Sandbox:
         workspace: Any,
         config: Optional[SandboxConfig] = None,
         template: Optional[Template] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         """Initialize sandbox (use Sandbox.create() instead)."""
         self.workspace_id = workspace_id
@@ -742,6 +981,9 @@ class Sandbox:
 
         # Template configuration
         self._template = template
+
+        # Store metadata
+        self._metadata = metadata or {}
 
         # Set user and workdir from template or config
         if template and template.user:
@@ -762,6 +1004,7 @@ class Sandbox:
         config: Optional[SandboxConfig] = None,
         workspace_id: Optional[str] = None,
         template: Optional[Template] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> "Sandbox":
         """
         Create a new sandbox instance synchronously (E2B-compatible).
@@ -781,12 +1024,16 @@ class Sandbox:
             with Sandbox.create(template=template) as sandbox:
                 result = sandbox.run_code("print('hello')")
 
+            # With metadata
+            sandbox = Sandbox.create(metadata={"team": "data-science"})
+
         Args:
             timeout: Default timeout for code execution in seconds
             envs: Environment variables to set
             config: Sandbox configuration
             workspace_id: Optional workspace ID (auto-generated if not provided)
             template: Optional template to use for sandbox configuration
+            metadata: Custom metadata for the sandbox
 
         Returns:
             Sandbox instance
@@ -797,6 +1044,7 @@ class Sandbox:
             config=config,
             workspace_id=workspace_id,
             template=template,
+            metadata=metadata,
         ))
 
     @classmethod
@@ -808,6 +1056,7 @@ class Sandbox:
         workspace_id: Optional[str] = None,
         external_workspace_path: Optional[str] = None,
         template: Optional[Template] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> "Sandbox":
         """
         Create a new sandbox instance (E2B-compatible).
@@ -819,6 +1068,7 @@ class Sandbox:
             workspace_id: Optional workspace ID (auto-generated if not provided)
             external_workspace_path: For local mode, use this path directly (will create symlink)
             template: Optional template to use for sandbox configuration
+            metadata: Custom metadata for the sandbox
 
         Returns:
             Sandbox instance
@@ -835,8 +1085,8 @@ class Sandbox:
             # Create SDK for remote API
             sdk = SandboxSDK(api_endpoint=config.api_endpoint)
 
-            # Create workspace on remote server
-            workspace = await sdk.create_workspace(workspace_id)
+            # Create workspace on remote server with metadata
+            workspace = await sdk.create_workspace(workspace_id, metadata=metadata)
             logger.info(f"Created remote sandbox with workspace: {workspace_id} at {config.api_endpoint}")
 
             # Create remote sandbox instance
@@ -856,7 +1106,7 @@ class Sandbox:
         # Manager will create symlink instead of real directory
         if external_workspace_path and config.default_backend == "local":
             try:
-                workspace = await manager.create_workspace(workspace_id, external_path=external_workspace_path)
+                workspace = await manager.create_workspace(workspace_id, external_path=external_workspace_path, metadata=metadata)
                 logger.info(f"Created workspace with symlink: {workspace_id} -> {external_workspace_path}")
             except FileExistsError:
                 workspace = await manager.get_workspace(workspace_id)
@@ -864,7 +1114,7 @@ class Sandbox:
         else:
             try:
                 # Create workspace
-                workspace = await manager.create_workspace(workspace_id)
+                workspace = await manager.create_workspace(workspace_id, metadata=metadata)
                 logger.info(f"Created sandbox with workspace: {workspace_id}")
             except FileExistsError:
                 # Workspace already exists, get it
@@ -878,6 +1128,7 @@ class Sandbox:
             workspace=workspace,
             config=config,
             template=template,
+            metadata=metadata,
         )
 
         # Apply template files and environment variables
@@ -1115,17 +1366,25 @@ class Sandbox:
         started_at = workspace.created_at if hasattr(workspace, 'created_at') else ""
         last_used = workspace.last_used_at if hasattr(workspace, 'last_used_at') else None
 
+        # Build metadata - merge sandbox metadata with workspace metadata
+        info_metadata = {
+            "workspace_id": self.workspace_id,
+            "host_path": workspace.host_path if hasattr(workspace, 'host_path') else "",
+            "guest_path": workspace.guest_path if hasattr(workspace, 'guest_path') else "/workspace",
+            "status": workspace.status if hasattr(workspace, 'status') else "ready",
+            "last_used_at": last_used,
+        }
+        # Add custom metadata (from workspace or sandbox)
+        if hasattr(workspace, 'metadata') and workspace.metadata:
+            info_metadata.update(workspace.metadata)
+        elif self._metadata:
+            info_metadata.update(self._metadata)
+
         return SandboxInfo(
             sandbox_id=self.workspace_id,
             template_id=None,
             name=self.workspace_id,
-            metadata={
-                "workspace_id": self.workspace_id,
-                "host_path": workspace.host_path if hasattr(workspace, 'host_path') else "",
-                "guest_path": workspace.guest_path if hasattr(workspace, 'guest_path') else "/workspace",
-                "status": workspace.status if hasattr(workspace, 'status') else "ready",
-                "last_used_at": last_used,
-            },
+            metadata=info_metadata,
             started_at=started_at,
             end_at=None,
         )

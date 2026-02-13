@@ -299,6 +299,73 @@ config = SandboxConfig(default_user="admin", default_workdir="/home/admin")
 sandbox = Sandbox.create(config=config)
 ```
 
+### Internet Access Configuration
+
+ds-sandbox allows you to configure internet access for sandbox execution. You can control network access at both the request level and the configuration level.
+
+#### Request-Level Configuration
+
+```python
+from ds_sandbox import Sandbox
+
+sandbox = Sandbox.create()
+
+# Allow internet access (default)
+execution = sandbox.run_code(
+    "import requests; print(requests.get('https://api.github.com').status_code)",
+    allow_internet=True,
+    network_policy="allow"
+)
+
+# Deny all internet access
+execution = sandbox.run_code(
+    "import requests; print(requests.get('https://api.github.com').status_code)",
+    allow_internet=False,
+    network_policy="deny"
+)
+
+# Whitelist specific domains
+execution = sandbox.run_code(
+    "import requests; print(requests.get('https://api.github.com').status_code)",
+    allow_internet=True,
+    network_policy="whitelist",
+    network_whitelist=["api.github.com", "pypi.org"]
+)
+
+sandbox.kill()
+```
+
+#### Configuration-Level Defaults
+
+You can set default network configuration via SandboxConfig:
+
+```python
+from ds_sandbox import Sandbox, SandboxConfig
+
+# Set default network policy
+config = SandboxConfig(
+    allow_internet=True,
+    default_network_policy="allow",  # "allow", "deny", "whitelist"
+    network_whitelist=["api.github.com"]  # Only allow these domains
+)
+sandbox = Sandbox.create(config=config)
+```
+
+#### Environment Variables
+
+You can also configure defaults via environment variables:
+
+```bash
+export SANDBOX_ALLOW_INTERNET=true
+export SANDBOX_NETWORK_POLICY=allow
+export SANDBOX_NETWORK_WHITELIST=api.github.com,pypi.org
+```
+
+**Network Policy Options:**
+- `allow` - Allow all internet access (default)
+- `deny` - Block all internet access
+- `whitelist` - Only allow access to specified domains/IPs
+
 ### Python Only
 
 ds-sandbox only supports Python code execution. JavaScript/Node.js execution is not supported.

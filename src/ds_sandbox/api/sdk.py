@@ -39,7 +39,7 @@ from ds_sandbox.errors import (
     ExecutionFailedError,
     WorkspaceNotFoundError,
 )
-from ds_sandbox.types import ExecutionResult, Workspace, DatasetInfo, SandboxInfo, SandboxEvent, PausedWorkspace, SandboxMetrics, Template
+from ds_sandbox.types import ExecutionResult, Workspace, DatasetInfo, SandboxInfo, SandboxEvent, PausedWorkspace, SandboxMetrics, Template, StorageConfig
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +259,7 @@ class SandboxSDK:
         self,
         workspace_id: str,
         setup_dirs: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Workspace:
         """
         Create a new workspace.
@@ -266,6 +267,7 @@ class SandboxSDK:
         Args:
             workspace_id: Unique identifier for the workspace
             setup_dirs: List of subdirectories to create (default: ["data", "models", "outputs"])
+            metadata: Custom metadata for the sandbox
 
         Returns:
             Workspace object with details
@@ -284,6 +286,7 @@ class SandboxSDK:
         payload = {
             "workspace_id": workspace_id,
             "setup_dirs": setup_dirs,
+            "metadata": metadata or {},
         }
 
         logger.info(f"Creating workspace: {workspace_id}")
@@ -675,6 +678,143 @@ class SandboxSDK:
         return [DatasetInfo(**item) for item in data]
 
     # =========================================================================
+    # Storage Management
+    # =========================================================================
+
+    async def mount_storage(
+        self,
+        workspace_id: str,
+        storage_config: StorageConfig,
+        mount_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Mount storage to a workspace.
+
+        Mounts cloud storage (S3, GCS, Azure) to a workspace, making it
+        accessible from within the sandbox.
+
+        Args:
+            workspace_id: Workspace identifier
+            storage_config: Storage configuration (provider, bucket, credentials, etc.)
+            mount_name: Optional name for this mount (defaults to bucket name)
+
+        Returns:
+            Dictionary with mount information including mount_point
+
+        Example:
+            >>> from ds_sandbox.types import StorageConfig
+            >>> config = StorageConfig(
+            ...     provider="s3",
+            ...     bucket="my-data-bucket",
+            ...     region="us-east-1"
+            ... )
+            >>> result = await sdk.mount_storage("my-experiment", config)
+            >>> print(result["mount_point"])
+            /workspace/storage/my-data-bucket
+        """
+        logger.info(f"Mounting storage to workspace: {workspace_id}")
+
+        payload = {
+            "storage_config": storage_config.model_dump(),
+            "mount_name": mount_name,
+        }
+
+        data = await self._request(
+            "POST",
+            f"/v1/workspaces/{workspace_id}/storage",
+            json=payload,
+        )
+
+        logger.info(f"Storage mounted to workspace: {workspace_id}")
+        return data
+
+    async def list_storage_mounts(
+        self,
+        workspace_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        List storage mounts for a workspace.
+
+        Returns all storage mounts configured for a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Returns:
+            List of storage mount configurations
+
+        Example:
+            >>> mounts = await sdk.list_storage_mounts("my-experiment")
+            >>> for m in mounts:
+            ...     print(f"{m['mount_name']}: {m['mount_point']}")
+        """
+        logger.debug(f"Listing storage mounts for workspace: {workspace_id}")
+        data = await self._request(
+            "GET",
+            f"/v1/workspaces/{workspace_id}/storage",
+        )
+        return data.get("mounts", [])
+
+    async def get_storage_mount(
+        self,
+        workspace_id: str,
+        mount_name: str,
+    ) -> Dict[str, Any]:
+        """
+        Get storage mount configuration.
+
+        Returns configuration for a specific storage mount.
+
+        Args:
+            workspace_id: Workspace identifier
+            mount_name: Name of the mount
+
+        Returns:
+            Storage mount configuration
+
+        Example:
+            >>> mount = await sdk.get_storage_mount("my-experiment", "my-bucket")
+            >>> print(mount["mount_point"])
+            /workspace/storage/my-bucket
+        """
+        logger.debug(f"Getting storage mount '{mount_name}' for workspace: {workspace_id}")
+        data = await self._request(
+            "GET",
+            f"/v1/workspaces/{workspace_id}/storage/{mount_name}",
+        )
+        return data
+
+    async def unmount_storage(
+        self,
+        workspace_id: str,
+        mount_name: str,
+    ) -> Dict[str, str]:
+        """
+        Unmount storage from a workspace.
+
+        Removes a storage mount from a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+            mount_name: Name of the mount to remove
+
+        Returns:
+            Response with status
+
+        Example:
+            >>> result = await sdk.unmount_storage("my-experiment", "my-bucket")
+            >>> print(result["status"])
+            unmounted
+        """
+        logger.info(f"Unmounting storage '{mount_name}' from workspace: {workspace_id}")
+        data = await self._request(
+            "DELETE",
+            f"/v1/workspaces/{workspace_id}/storage/{mount_name}",
+        )
+        logger.info(f"Storage unmounted from workspace: {workspace_id}")
+        return data
+
+    # =========================================================================
     # Code Execution (Core Functionality)
     # =========================================================================
 
@@ -1034,6 +1174,7 @@ class SandboxSDK:
         self,
         workspace_id: str,
         setup_dirs: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Workspace:
         """
         Synchronous wrapper for create_workspace.
@@ -1044,7 +1185,7 @@ class SandboxSDK:
         Returns:
             Workspace object
         """
-        return asyncio.run(self.create_workspace(workspace_id, setup_dirs))
+        return asyncio.run(self.create_workspace(workspace_id, setup_dirs, metadata))
 
     def get_workspace_sync(self, workspace_id: str) -> Workspace:
         """
@@ -1287,6 +1428,74 @@ class SandboxSDK:
             List of all SandboxMetrics objects
         """
         return asyncio.run(self.get_system_metrics())
+
+    # =========================================================================
+    # Storage Management (Sync Wrappers)
+    # =========================================================================
+
+    def mount_storage_sync(
+        self,
+        workspace_id: str,
+        storage_config: StorageConfig,
+        mount_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Synchronous wrapper for mount_storage.
+
+        Args:
+            Same as mount_storage()
+
+        Returns:
+            Dictionary with mount information
+        """
+        return asyncio.run(self.mount_storage(workspace_id, storage_config, mount_name))
+
+    def list_storage_mounts_sync(
+        self,
+        workspace_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Synchronous wrapper for list_storage_mounts.
+
+        Args:
+            Same as list_storage_mounts()
+
+        Returns:
+            List of storage mount configurations
+        """
+        return asyncio.run(self.list_storage_mounts(workspace_id))
+
+    def get_storage_mount_sync(
+        self,
+        workspace_id: str,
+        mount_name: str,
+    ) -> Dict[str, Any]:
+        """
+        Synchronous wrapper for get_storage_mount.
+
+        Args:
+            Same as get_storage_mount()
+
+        Returns:
+            Storage mount configuration
+        """
+        return asyncio.run(self.get_storage_mount(workspace_id, mount_name))
+
+    def unmount_storage_sync(
+        self,
+        workspace_id: str,
+        mount_name: str,
+    ) -> Dict[str, str]:
+        """
+        Synchronous wrapper for unmount_storage.
+
+        Args:
+            Same as unmount_storage()
+
+        Returns:
+            Response with status
+        """
+        return asyncio.run(self.unmount_storage(workspace_id, mount_name))
 
     # =========================================================================
     # Template Management

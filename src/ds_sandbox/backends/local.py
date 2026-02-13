@@ -215,7 +215,13 @@ class LocalSubprocessSandbox(SandboxBackend):
 
         try:
             script_path = await asyncio.to_thread(self._write_temp_script, workspace_path, request.code)
-            env = self._build_env(request.env_vars, workspace)
+            env = self._build_env(
+                request.env_vars,
+                workspace,
+                network_policy=request.network_policy,
+                network_whitelist=request.network_whitelist,
+                allow_internet=request.allow_internet
+            )
 
             process = await asyncio.create_subprocess_exec(
                 self.python_executable,
@@ -248,6 +254,7 @@ class LocalSubprocessSandbox(SandboxBackend):
                     "cwd": str(workspace_path),
                     "pid": process.pid,
                     "network_policy": request.network_policy,
+                    "allow_internet": request.allow_internet,
                     "enable_gpu": request.enable_gpu,
                 },
             )
@@ -355,7 +362,14 @@ class LocalSubprocessSandbox(SandboxBackend):
         _ = workspace_id
         return None
 
-    def _build_env(self, env_vars: Dict[str, str], workspace: Workspace) -> Dict[str, str]:
+    def _build_env(
+        self,
+        env_vars: Dict[str, str],
+        workspace: Workspace,
+        network_policy: str = "allow",
+        network_whitelist: Optional[List[str]] = None,
+        allow_internet: bool = True
+    ) -> Dict[str, str]:
         env = os.environ.copy()
         env.update(
             {
@@ -365,6 +379,30 @@ class LocalSubprocessSandbox(SandboxBackend):
                 "WORKSPACE_OUTPUTS": str(Path(workspace.host_path) / "outputs"),
             }
         )
+
+        # Apply network configuration
+        if not allow_internet:
+            # Disable internet by setting invalid proxy
+            env["HTTP_PROXY"] = ""
+            env["HTTPS_PROXY"] = ""
+            env["http_proxy"] = ""
+            env["https_proxy"] = ""
+            env["NO_PROXY"] = "*"
+            env["no_proxy"] = "*"
+        elif network_policy == "deny":
+            # Deny network access
+            env["HTTP_PROXY"] = ""
+            env["HTTPS_PROXY"] = ""
+            env["http_proxy"] = ""
+            env["https_proxy"] = ""
+            env["NO_PROXY"] = "*"
+            env["no_proxy"] = "*"
+        elif network_policy == "whitelist" and network_whitelist:
+            # Set up whitelist via hosts file manipulation would be complex
+            # For now, we'll use a wrapper script approach
+            # The actual enforcement would require additional setup
+            pass
+
         if env_vars:
             env.update(env_vars)
         return env

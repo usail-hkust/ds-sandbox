@@ -37,6 +37,7 @@ from ds_sandbox.types import (
     PausedWorkspace,
     SandboxMetrics,
     Template,
+    StorageConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ class SandboxManager:
         self._metrics_history: Dict[str, List[SandboxMetrics]] = {}
         self._templates: Dict[str, Template] = {}
         self._template_aliases: Dict[str, str] = {}  # alias -> template_id
+        self._storage_mounts: Dict[str, Dict[str, StorageConfig]] = {}  # workspace_id -> {mount_name -> StorageConfig}
 
         # Ensure paused workspaces directory exists
         self._paused_dir = Path(config.paused_workspaces_base_dir)
@@ -566,6 +568,7 @@ class SandboxManager:
         workspace_id: str,
         setup_dirs: Optional[List[str]] = None,
         external_path: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Workspace:
         """
         Create a new workspace.
@@ -584,6 +587,7 @@ class SandboxManager:
             workspace_id: Unique workspace identifier
             setup_dirs: Additional subdirectories to create
             external_path: If provided, create symlink to this path instead of real directory (for local backend)
+            metadata: Custom metadata for the sandbox
 
         Returns:
             Workspace object with workspace information
@@ -592,6 +596,8 @@ class SandboxManager:
             FileExistsError: If workspace already exists
             PermissionError: If unable to create directories
         """
+        from typing import Dict, Any
+
         # Validate workspace_id against path traversal
         validate_path_component(workspace_id, "workspace_id")
 
@@ -641,6 +647,7 @@ class SandboxManager:
                 status="ready",
                 created_at=now,
                 last_used_at=None,
+                metadata=metadata or {},
             )
 
             # Cache workspace
@@ -1081,6 +1088,239 @@ class SandboxManager:
 
         logger.info(f"Cleaned up {cleaned} expired paused workspaces")
         return cleaned
+
+    # =========================================================================
+    # Storage Management
+    # =========================================================================
+
+    async def mount_storage(
+        self,
+        workspace_id: str,
+        storage_config: StorageConfig,
+        mount_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Mount storage to a workspace.
+
+        This method mounts cloud storage (S3, GCS, Azure) to a workspace,
+        making the storage bucket accessible from within the sandbox.
+
+        Args:
+            workspace_id: Workspace identifier
+            storage_config: Storage configuration (provider, bucket, credentials, etc.)
+            mount_name: Optional name for this mount (defaults to bucket name)
+
+        Returns:
+            Dictionary with mount information including mount_point
+
+        Raises:
+            WorkspaceNotFoundError: If workspace doesn't exist
+        """
+        # Validate workspace exists
+        workspace = await self.get_workspace(workspace_id)
+
+        # Generate mount name if not provided
+        if mount_name is None:
+            mount_name = storage_config.bucket
+
+        # Validate mount_name against path traversal
+        validate_path_component(mount_name, "mount_name")
+
+        # Initialize storage mounts dict for this workspace if needed
+        if workspace_id not in self._storage_mounts:
+            self._storage_mounts[workspace_id] = {}
+
+        # Check if mount already exists
+        if mount_name in self._storage_mounts[workspace_id]:
+            logger.warning(f"Storage mount '{mount_name}' already exists in workspace {workspace_id}")
+
+        # Determine mount point
+        mount_point = storage_config.mount_point
+        if mount_point is None:
+            mount_point = f"{self.config.storage_base_dir}/{mount_name}"
+
+        # Store the storage config
+        self._storage_mounts[workspace_id][mount_name] = storage_config
+
+        # Emit lifecycle event
+        self.emit_event(
+            event_type="storage.mounted",
+            workspace_id=workspace_id,
+            event_data={
+                "mount_name": mount_name,
+                "provider": storage_config.provider,
+                "bucket": storage_config.bucket,
+                "mount_point": mount_point,
+                "read_only": storage_config.read_only,
+            },
+        )
+
+        logger.info(
+            f"Mounted storage '{mount_name}' (bucket: {storage_config.bucket}) "
+            f"to workspace {workspace_id} at {mount_point}"
+        )
+
+        return {
+            "mount_name": mount_name,
+            "provider": storage_config.provider,
+            "bucket": storage_config.bucket,
+            "mount_point": mount_point,
+            "path_prefix": storage_config.path_prefix,
+            "read_only": storage_config.read_only,
+        }
+
+    async def unmount_storage(
+        self,
+        workspace_id: str,
+        mount_name: str,
+    ) -> Dict[str, str]:
+        """
+        Unmount storage from a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+            mount_name: Name of the mount to remove
+
+        Returns:
+            Dictionary with status information
+
+        Raises:
+            WorkspaceNotFoundError: If workspace doesn't exist
+        """
+        # Validate workspace exists
+        await self.get_workspace(workspace_id)
+
+        # Check if storage mounts exist for this workspace
+        if workspace_id not in self._storage_mounts:
+            raise SandboxError(
+                message=f"No storage mounts found in workspace {workspace_id}",
+                error_code="STORAGE_NOT_FOUND",
+            )
+
+        # Check if mount exists
+        if mount_name not in self._storage_mounts[workspace_id]:
+            raise SandboxError(
+                message=f"Storage mount '{mount_name}' not found in workspace {workspace_id}",
+                error_code="STORAGE_NOT_FOUND",
+            )
+
+        # Get the storage config for the event
+        storage_config = self._storage_mounts[workspace_id][mount_name]
+
+        # Remove the mount
+        del self._storage_mounts[workspace_id][mount_name]
+
+        # Clean up empty dict
+        if not self._storage_mounts[workspace_id]:
+            del self._storage_mounts[workspace_id]
+
+        # Emit lifecycle event
+        self.emit_event(
+            event_type="storage.unmounted",
+            workspace_id=workspace_id,
+            event_data={
+                "mount_name": mount_name,
+                "provider": storage_config.provider,
+                "bucket": storage_config.bucket,
+            },
+        )
+
+        logger.info(f"Unmounted storage '{mount_name}' from workspace {workspace_id}")
+
+        return {
+            "status": "unmounted",
+            "mount_name": mount_name,
+        }
+
+    async def list_storage_mounts(
+        self,
+        workspace_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        List storage mounts for a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Returns:
+            List of storage mount configurations
+
+        Raises:
+            WorkspaceNotFoundError: If workspace doesn't exist
+        """
+        # Validate workspace exists
+        await self.get_workspace(workspace_id)
+
+        # Return empty list if no mounts
+        if workspace_id not in self._storage_mounts:
+            return []
+
+        mounts = []
+        for mount_name, config in self._storage_mounts[workspace_id].items():
+            mount_point = config.mount_point
+            if mount_point is None:
+                mount_point = f"{self.config.storage_base_dir}/{mount_name}"
+
+            mounts.append({
+                "mount_name": mount_name,
+                "provider": config.provider,
+                "bucket": config.bucket,
+                "mount_point": mount_point,
+                "path_prefix": config.path_prefix,
+                "read_only": config.read_only,
+            })
+
+        return mounts
+
+    async def get_storage_mount(
+        self,
+        workspace_id: str,
+        mount_name: str,
+    ) -> Dict[str, Any]:
+        """
+        Get storage mount configuration for a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+            mount_name: Name of the mount
+
+        Returns:
+            Storage mount configuration (without credentials)
+
+        Raises:
+            WorkspaceNotFoundError: If workspace doesn't exist
+            SandboxError: If mount not found
+        """
+        # Validate workspace exists
+        await self.get_workspace(workspace_id)
+
+        # Check if storage mounts exist
+        if workspace_id not in self._storage_mounts:
+            raise SandboxError(
+                message=f"No storage mounts found in workspace {workspace_id}",
+                error_code="STORAGE_NOT_FOUND",
+            )
+
+        # Check if mount exists
+        if mount_name not in self._storage_mounts[workspace_id]:
+            raise SandboxError(
+                message=f"Storage mount '{mount_name}' not found in workspace {workspace_id}",
+                error_code="STORAGE_NOT_FOUND",
+            )
+
+        config = self._storage_mounts[workspace_id][mount_name]
+        mount_point = config.mount_point
+        if mount_point is None:
+            mount_point = f"{self.config.storage_base_dir}/{mount_name}"
+
+        return {
+            "mount_name": mount_name,
+            "provider": config.provider,
+            "bucket": config.bucket,
+            "mount_point": mount_point,
+            "path_prefix": config.path_prefix,
+            "read_only": config.read_only,
+        }
 
     async def _prepare_datasets(
         self,
