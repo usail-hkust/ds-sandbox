@@ -42,8 +42,19 @@
 - 🔧 **Pluggable Backends** - Docker, Local Subprocess, Firecracker (coming soon), Kata Containers (coming soon)
 - 📁 **Workspace-First** - Data in workspace relative paths, seamless data access
 - 🛡️ **Enterprise Security** - Code scanning, resource limits, network policies, audit logging
-- 🌐 **Multi-Language Support** (coming soon) - REST API, Python SDK, MCP server
 - 🚀 **Production Ready** - Metrics, health checks, high availability
+- 📋 **E2B-Compatible API** - Templates, user/workdir support for easy migration
+
+## 🚀 Why ds-sandbox?
+
+ds-sandbox is lightweight, local-first, and perfect for individual developers or small-scale deployments:
+
+- 🖥️ **Local Deployment** - No cloud services or API keys required, runs entirely on your machine
+- 🐳 **Simple Setup** - Single-machine or Docker deployment, no complex infrastructure
+- 💰 **Free & Self-Hosted** - No cloud costs, full control over your data and execution environment
+- 🔒 **Data Privacy** - Code and data never leave your infrastructure
+
+**Note:** ds-sandbox only supports Python code execution. JavaScript/Node.js execution is not supported.
 
 ## 🎯 Use Cases
 
@@ -70,7 +81,9 @@ pip install -e .
 
 ## 🚀 Quick Start
 
-Write code for starting Sandbox, executing Python inside it and listing all files inside the root directory.
+Write code for starting Sandbox (local mode by default), executing Python inside it and listing all files inside the root directory.
+
+> **Note**: Local mode uses the same Python environment as your local machine. For isolated container execution, use Docker mode.
 
 ### Python
 
@@ -78,12 +91,14 @@ Write code for starting Sandbox, executing Python inside it and listing all file
 # main.py
 from ds_sandbox import Sandbox
 
-sbx = Sandbox()  # Create a new sandbox instance
+sbx = Sandbox.create()  # Create a new sandbox instance (local mode by default)
 execution = sbx.run_code("print('hello world')")  # Execute Python inside the sandbox
 print(execution.logs)
 
 files = sbx.files.list("/")
 print(files)
+
+sbx.kill()
 ```
 
 ### Connect LLMs
@@ -116,7 +131,7 @@ code = response.choices[0].message.content
 
 # Execute code in ds-sandbox
 if code:
-    with Sandbox() as sandbox:
+    with Sandbox.create() as sandbox:
         execution = sandbox.run_code(code)
         result = execution.text
 
@@ -127,17 +142,21 @@ if code:
 
 ds-sandbox allows you to upload and download files to and from the Sandbox.
 
+**Note:** The default working directory is `/home/user`. Files are stored relative to the workspace root.
+
 #### Upload File
 
 ```python
 from ds_sandbox import Sandbox
 
-sbx = Sandbox()
+sbx = Sandbox.create()
 
 # Read local file relative to the current working directory
 with open("local/file", "rb") as file:
-    # Upload file to the sandbox to absolute path '/home/user/my-file'
-    sbx.files.write("/home/user/my-file", file)
+    # Upload file to the sandbox (default workdir is /home/user)
+    sbx.files.write("my-file", file)
+
+sbx.kill()
 ```
 
 #### Upload Multiple Files
@@ -145,16 +164,18 @@ with open("local/file", "rb") as file:
 ```python
 from ds_sandbox import Sandbox
 
-sbx = Sandbox()
+sbx = Sandbox.create()
 
 # Read local file relative to the current working directory
 with open("local/file/a", "rb") as file:
-    # Upload file to the sandbox to absolute path '/home/user/my-file-a'
-    sbx.files.write("/home/user/my-file-a", file)
+    # Upload file to the sandbox
+    sbx.files.write("my-file-a", file)
 
 with open("local/file/b", "rb") as file:
-    # Upload file to the sandbox to absolute path '/home/user/my-file-b'
-    sbx.files.write("/home/user/my-file-b", file)
+    # Upload file to the sandbox
+    sbx.files.write("my-file-b", file)
+
+sbx.kill()
 ```
 
 #### Download File
@@ -162,10 +183,10 @@ with open("local/file/b", "rb") as file:
 ```python
 from ds_sandbox import Sandbox
 
-sbx = Sandbox()
+sbx = Sandbox.create()
 
-# Download file from the sandbox to absolute path '/home/user/my-file'
-content = sbx.files.read('/home/user/my-file')
+# Download file from the sandbox
+content = sbx.files.read('my-file')
 # Write file to local path relative to the current working directory
 with open('local/file', 'w') as file:
     file.write(content)
@@ -176,19 +197,118 @@ with open('local/file', 'w') as file:
 ```python
 from ds_sandbox import Sandbox
 
-sbx = Sandbox()
+sbx = Sandbox.create()
 
-# Download file A from the sandbox by absolute path '/home/user/my-file-a'
-contentA = sbx.files.read('/home/user/my-file-a')
+# Download file A from the sandbox
+contentA = sbx.files.read('my-file-a')
 # Write file A to local path relative to the current working directory
 with open('local/file/a', 'w') as file:
     file.write(contentA)
 
-# Download file B from the sandbox by absolute path '/home/user/my-file-b'
-contentB = sbx.files.read('/home/user/my-file-b')
+# Download file B from the sandbox
+contentB = sbx.files.read('my-file-b')
 # Write file B to local path relative to the current working directory
 with open('local/file/b', 'w') as file:
     file.write(contentB)
+
+sbx.kill()
+```
+
+### Templates
+
+ds-sandbox supports E2B-compatible templates for customizing sandbox environments.
+
+```python
+from ds_sandbox import Sandbox, Template
+
+# Create a custom template
+template = Template(
+    id="my-custom-template",
+    name="My Custom Template",
+    env={"CUSTOM_VAR": "value", "PYTHONPATH": "/home/user/lib"},
+    files={
+        "setup.sh": "#!/bin/bash\necho 'Setting up...'\n",
+        "config.json": '{"key": "value"}',
+    },
+    user="developer",
+    workdir="/home/developer",
+)
+
+# Use the template when creating a sandbox
+sandbox = Sandbox.create(template=template)
+
+# Access user and workdir
+print(sandbox.user)    # "developer"
+print(sandbox.workdir) # "/home/developer"
+
+sandbox.kill()
+```
+
+Templates can also be stored as YAML files in the templates directory (default: `/etc/ds-sandbox/templates`):
+
+```yaml
+# /etc/ds-sandbox/templates/my-template.yaml
+id: "my-template"
+name: "My Custom Template"
+env:
+  CUSTOM_VAR: "value"
+files:
+  setup.sh: "#!/bin/bash\necho 'Hello'\n"
+user: "developer"
+workdir: "/home/developer"
+```
+
+Load templates from files:
+
+```python
+from ds_sandbox import Sandbox, SandboxConfig
+
+# Load template from file
+template = SandboxConfig.load_template("my-template")
+if template:
+    sandbox = Sandbox.create(template=template)
+```
+
+### User and Working Directory
+
+ds-sandbox provides default user "user" and working directory "/home/user":
+
+```python
+from ds_sandbox import Sandbox
+
+sandbox = Sandbox.create()
+
+# Default user and workdir
+print(sandbox.user)    # "user"
+print(sandbox.workdir) # "/home/user"
+
+sandbox.kill()
+```
+
+You can customize user and workdir via Template or SandboxConfig:
+
+```python
+from ds_sandbox import Sandbox, Template, SandboxConfig
+
+# Via template
+template = Template(user="customuser", workdir="/workspace")
+sandbox = Sandbox.create(template=template)
+
+# Via config (sets defaults for all sandboxes)
+config = SandboxConfig(default_user="admin", default_workdir="/home/admin")
+sandbox = Sandbox.create(config=config)
+```
+
+### Python Only
+
+ds-sandbox only supports Python code execution. JavaScript/Node.js execution is not supported.
+
+```python
+# This works
+result = sandbox.run_code("print('Hello, World!')")
+
+# JavaScript/Node.js is NOT supported
+# result = sandbox.run_js("console.log('Hello')")  # Won't work!
 ```
 
 ## 📚 Documentation
