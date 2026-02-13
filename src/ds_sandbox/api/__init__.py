@@ -27,6 +27,7 @@ from ds_sandbox.api.mcp import (
     create_mcp_server,
     create_standalone_server,
 )
+from ds_sandbox.types import SandboxEvent
 
 __all__ = [
     "create_app",
@@ -48,4 +49,6 @@ __all__ = [
     "StandaloneMCPServer",
     "create_mcp_server",
     "create_standalone_server",
+    # Types
+    "SandboxEvent",
 ]

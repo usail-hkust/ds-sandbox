@@ -12,7 +12,15 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from ds_sandbox.config import SandboxConfig
 from ds_sandbox.manager import SandboxManager
-from ds_sandbox.types import ExecutionRequest
+from ds_sandbox.types import ExecutionRequest, SandboxInfo, Template, PausedWorkspace, SandboxMetrics
+from ds_sandbox.api.sdk import SandboxSDK
+
+# Warning constants
+JAVASCRIPT_WARNING = (
+    "ds-sandbox only supports Python execution. "
+    "JavaScript/Node.js execution is not supported. "
+    "Use Python for code execution in ds-sandbox."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +43,18 @@ class Files:
             The path where the file was saved
         """
         return asyncio.run(self._write_async(path, content))
+
+    def create(self, path: str, content: Union[bytes, str]) -> str:
+        """Create a file with content (E2B-compatible alias for write).
+
+        Args:
+            path: Destination path in the sandbox.
+            content: File content as bytes or string
+
+        Returns:
+            The path where the file was created
+        """
+        return self.write(path, content)
 
     async def _write_async(self, path: str, content: Union[bytes, str]) -> str:
         """Write content to a file asynchronously.
@@ -106,7 +126,18 @@ class Files:
 
         return host_path.read_bytes()
 
-    async def list(self, path: str = None) -> List[Dict[str, Any]]:
+    def list(self, path: str = None) -> List[Dict[str, Any]]:
+        """List files in a directory synchronously (E2B-compatible).
+
+        Args:
+            path: Directory path in the sandbox (default: workspace root)
+
+        Returns:
+            List of file/directory information
+        """
+        return asyncio.run(self._list_async(path))
+
+    async def _list_async(self, path: str = None) -> List[Dict[str, Any]]:
         """List files in a directory.
 
         Args:
@@ -140,6 +171,227 @@ class Files:
             })
 
         return results
+
+    def exists(self, path: str) -> bool:
+        """Check if a file or directory exists (E2B-compatible).
+
+        Args:
+            path: Path to check in the sandbox.
+
+        Returns:
+            True if file or directory exists
+        """
+        return asyncio.run(self._exists_async(path))
+
+    async def _exists_async(self, path: str) -> bool:
+        """Check if a file or directory exists asynchronously."""
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        rel_path = path.lstrip("/")
+        host_path = Path(workspace.host_path) / rel_path
+        return host_path.exists()
+
+    def get_info(self, path: str) -> Dict[str, Any]:
+        """Get information about a file or directory (E2B-compatible).
+
+        Args:
+            path: Path to get info for in the sandbox.
+
+        Returns:
+            Dictionary with file/directory information
+        """
+        return asyncio.run(self._get_info_async(path))
+
+    async def _get_info_async(self, path: str) -> Dict[str, Any]:
+        """Get information about a file or directory asynchronously."""
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        rel_path = path.lstrip("/")
+        host_path = Path(workspace.host_path) / rel_path
+
+        if not host_path.exists():
+            raise FileNotFoundError(f"Path not found: {path}")
+
+        stat = host_path.stat()
+        return {
+            "name": host_path.name,
+            "path": str(host_path),
+            "is_file": host_path.is_file(),
+            "is_dir": host_path.is_dir(),
+            "size": stat.st_size,
+            "created_at": stat.st_ctime,
+            "modified_at": stat.st_mtime,
+        }
+
+    def remove(self, path: str) -> None:
+        """Remove a file or directory (E2B-compatible).
+
+        Args:
+            path: Path to remove in the sandbox.
+        """
+        return asyncio.run(self._remove_async(path))
+
+    async def _remove_async(self, path: str) -> None:
+        """Remove a file or directory asynchronously."""
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        rel_path = path.lstrip("/")
+        host_path = Path(workspace.host_path) / rel_path
+
+        if not host_path.exists():
+            raise FileNotFoundError(f"Path not found: {path}")
+
+        if host_path.is_file():
+            host_path.unlink()
+        elif host_path.is_dir():
+            import shutil
+            shutil.rmtree(host_path)
+
+        logger.debug(f"Removed: {host_path}")
+
+    def rename(self, old_path: str, new_path: str) -> str:
+        """Rename a file or directory (E2B-compatible).
+
+        Args:
+            old_path: Current path in the sandbox.
+            new_path: New path in the sandbox.
+
+        Returns:
+            The new path
+        """
+        return asyncio.run(self._rename_async(old_path, new_path))
+
+    async def _rename_async(self, old_path: str, new_path: str) -> str:
+        """Rename a file or directory asynchronously."""
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        old_rel_path = old_path.lstrip("/")
+        new_rel_path = new_path.lstrip("/")
+
+        old_host_path = Path(workspace.host_path) / old_rel_path
+        new_host_path = Path(workspace.host_path) / new_rel_path
+
+        if not old_host_path.exists():
+            raise FileNotFoundError(f"Path not found: {old_path}")
+
+        old_host_path.rename(new_host_path)
+        logger.debug(f"Renamed: {old_host_path} -> {new_host_path}")
+        return new_path
+
+    def make_dir(self, path: str) -> str:
+        """Create a directory (E2B-compatible).
+
+        Args:
+            path: Directory path to create in the sandbox.
+
+        Returns:
+            The created directory path
+        """
+        return asyncio.run(self._make_dir_async(path))
+
+    async def _make_dir_async(self, path: str) -> str:
+        """Create a directory asynchronously."""
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        rel_path = path.lstrip("/")
+        host_path = Path(workspace.host_path) / rel_path
+
+        host_path.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Created directory: {host_path}")
+        return path
+
+    def write_files(self, files: Dict[str, Union[bytes, str]]) -> List[str]:
+        """Write multiple files at once (E2B-compatible).
+
+        Args:
+            files: Dictionary mapping paths to content
+
+        Returns:
+            List of created file paths
+        """
+        return asyncio.run(self._write_files_async(files))
+
+    async def _write_files_async(self, files: Dict[str, Union[bytes, str]]) -> List[str]:
+        """Write multiple files at once asynchronously."""
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        created_paths = []
+        for path, content in files.items():
+            rel_path = path.lstrip("/")
+            host_path = Path(workspace.host_path) / rel_path
+            host_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if isinstance(content, str):
+                host_path.write_text(content, encoding="utf-8")
+            else:
+                host_path.write_bytes(content)
+
+            created_paths.append(path)
+            logger.debug(f"Wrote file: {host_path}")
+
+        return created_paths
+
+    async def watch_dir(
+        self,
+        path: str,
+        callback: Callable[[Dict[str, Any]], None],
+        recursive: bool = False,
+    ) -> None:
+        """Watch a directory for changes (E2B-compatible).
+
+        Args:
+            path: Directory path to watch in the sandbox.
+            callback: Callback function called on file changes.
+            recursive: Whether to watch subdirectories recursively.
+        """
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        rel_path = path.lstrip("/")
+        host_path = Path(workspace.host_path) / rel_path
+
+        if not host_path.exists():
+            raise FileNotFoundError(f"Directory not found: {path}")
+
+        # Use watchdog for directory monitoring
+        try:
+            from watchdog.observers import Observer
+            from watchdog.events import FileSystemEventHandler
+
+            class ChangeHandler(FileSystemEventHandler):
+                def __init__(self, cb):
+                    self._cb = cb
+
+                def on_any_event(self, event):
+                    if not event.is_directory:
+                        self._cb({
+                            "type": event.event_type,
+                            "path": event.src_path,
+                            "is_directory": event.is_directory,
+                        })
+
+            handler = ChangeHandler(callback)
+            observer = Observer()
+            observer.schedule(handler, str(host_path), recursive=recursive)
+            observer.start()
+
+            # Keep observer alive - caller should handle stopping
+            self._watch_observer = observer
+        except ImportError:
+            logger.warning("watchdog not installed, watch_dir will not function")
 
 
 class Commands:
@@ -252,6 +504,199 @@ class ExecutionLogs2:
         self.stderr = stderr
 
 
+class RemoteSandbox:
+    """
+    Remote Sandbox that connects to ds-sandbox API server.
+
+    Usage:
+        >>> from ds_sandbox import Sandbox
+        >>>
+        >>> # Connect to remote API server
+        >>> sandbox = Sandbox.create(
+        ...     config=SandboxConfig(api_endpoint="http://192.168.1.100:8000")
+        ... )
+        >>>
+        >>> result = sandbox.run_code("print('hello')")
+        >>> print(result.stdout)
+        >>>
+        >>> sandbox.kill()
+    """
+
+    def __init__(
+        self,
+        workspace_id: str,
+        sdk: SandboxSDK,
+        workspace: Any,
+        config: SandboxConfig,
+    ):
+        self.workspace_id = workspace_id
+        self._sdk = sdk
+        self.workspace = workspace
+        self.config = config
+        self._files = Files(self)
+        self.sandbox_id = workspace_id
+
+    @property
+    def files(self) -> Files:
+        return self._files
+
+    def run_code(
+        self,
+        code: str,
+        timeout: Optional[int] = None,
+    ) -> CodeResult:
+        """Run Python code synchronously via remote API."""
+        return asyncio.run(self.run_code_async(code, timeout=timeout))
+
+    async def run_code_async(
+        self,
+        code: str,
+        timeout: Optional[int] = None,
+    ) -> CodeResult:
+        """Run Python code asynchronously via remote API."""
+        # Use execute() with wait=True (default) to get full result
+        result = await self._sdk.execute(
+            workspace_id=self.workspace_id,
+            code=code,
+            timeout_sec=timeout or 3600,
+        )
+        return CodeResult(
+            logs=ExecutionLogs2(stdout=result.stdout, stderr=result.stderr),
+            error=result.stderr if not result.success else None,
+            results=None,
+            _stdout=result.stdout,
+            _stderr=result.stderr,
+        )
+
+    async def kill(self):
+        """Kill the sandbox (stop workspace)."""
+        await self._sdk.delete_workspace(self.workspace_id)
+
+    def kill_sync(self):
+        """Kill the sandbox synchronously."""
+        asyncio.run(self.kill())
+
+    # Context manager support (E2B-compatible)
+    def __enter__(self):
+        """Synchronous context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Synchronous context manager exit."""
+        self.kill_sync()
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.kill()
+
+    def set_timeout(self, timeout: int) -> None:
+        """
+        Set sandbox timeout (E2B-compatible).
+
+        Changes the sandbox timeout during runtime.
+
+        Args:
+            timeout: New timeout in seconds
+        """
+        asyncio.run(self._set_timeout_async(timeout))
+
+    async def _set_timeout_async(self, timeout: int) -> None:
+        """Set timeout asynchronously via SDK."""
+        await self._sdk.set_timeout(self.workspace_id, timeout)
+        self.config.default_timeout_sec = timeout
+
+    def get_info(self) -> SandboxInfo:
+        """
+        Get sandbox information (E2B-compatible).
+
+        Returns:
+            SandboxInfo object with sandbox details
+        """
+        return asyncio.run(self._get_info_async())
+
+    async def _get_info_async(self) -> SandboxInfo:
+        """Get sandbox info asynchronously via SDK."""
+        return await self._sdk.get_sandbox_info(self.workspace_id)
+
+    def pause(self) -> PausedWorkspace:
+        """
+        Pause the sandbox and save its state (E2B-compatible).
+
+        Saves the workspace filesystem to a backup directory via remote API.
+
+        Returns:
+            PausedWorkspace object with backup information
+        """
+        return asyncio.run(self._sdk.pause_workspace(self.workspace_id))
+
+    async def pause_async(self) -> PausedWorkspace:
+        """
+        Pause the sandbox asynchronously via remote API.
+
+        Returns:
+            PausedWorkspace object with backup information
+        """
+        return await self._sdk.pause_workspace(self.workspace_id)
+
+    def resume(self, workspace_id: Optional[str] = None) -> "RemoteSandbox":
+        """
+        Resume a paused sandbox (E2B-compatible).
+
+        Restores the workspace from its saved state via remote API.
+
+        Args:
+            workspace_id: Optional workspace ID to resume
+
+        Returns:
+            RemoteSandbox instance with restored workspace
+        """
+        return asyncio.run(self.resume_async(workspace_id))
+
+    async def resume_async(self, workspace_id: Optional[str] = None) -> "RemoteSandbox":
+        """
+        Resume a paused sandbox asynchronously via remote API.
+
+        Args:
+            workspace_id: Optional workspace ID to resume
+
+        Returns:
+            RemoteSandbox instance with restored workspace
+        """
+        target_workspace_id = workspace_id or self.workspace_id
+
+        # Resume the workspace via SDK
+        workspace = await self._sdk.resume_workspace(target_workspace_id)
+        logger.info(f"Remote sandbox resumed: {target_workspace_id}")
+
+        # Update current sandbox
+        self.workspace = workspace
+        return self
+
+    def get_metrics(self) -> List[SandboxMetrics]:
+        """
+        Get sandbox metrics (E2B-compatible).
+
+        Returns CPU and memory metrics for the sandbox.
+
+        Returns:
+            List of SandboxMetrics objects with timestamped metrics
+        """
+        return asyncio.run(self._get_metrics_async())
+
+    async def _get_metrics_async(self) -> List[SandboxMetrics]:
+        """
+        Get sandbox metrics asynchronously via remote API.
+
+        Returns:
+            List of SandboxMetrics objects with timestamped metrics
+        """
+        return await self._sdk.get_metrics(self.workspace_id)
+
+
 class Sandbox:
     """
     E2B-compatible Sandbox API for ds-sandbox.
@@ -284,6 +729,7 @@ class Sandbox:
         manager: SandboxManager,
         workspace: Any,
         config: Optional[SandboxConfig] = None,
+        template: Optional[Template] = None,
     ):
         """Initialize sandbox (use Sandbox.create() instead)."""
         self.workspace_id = workspace_id
@@ -294,6 +740,20 @@ class Sandbox:
         self._commands = Commands(self)
         self.sandbox_id = workspace_id
 
+        # Template configuration
+        self._template = template
+
+        # Set user and workdir from template or config
+        if template and template.user:
+            self._user = template.user
+        else:
+            self._user = self.config.default_user
+
+        if template and template.workdir:
+            self._workdir = template.workdir
+        else:
+            self._workdir = self.config.default_workdir
+
     @classmethod
     def create(
         cls,
@@ -301,6 +761,7 @@ class Sandbox:
         envs: Optional[Dict[str, str]] = None,
         config: Optional[SandboxConfig] = None,
         workspace_id: Optional[str] = None,
+        template: Optional[Template] = None,
     ) -> "Sandbox":
         """
         Create a new sandbox instance synchronously (E2B-compatible).
@@ -309,11 +770,23 @@ class Sandbox:
             with Sandbox.create() as sandbox:
                 result = sandbox.run_code("print('hello')")
 
+            # Using a template
+            from ds_sandbox import Template
+            template = Template(
+                id="my-template",
+                env={"MY_VAR": "value"},
+                user="customuser",
+                workdir="/home/customuser",
+            )
+            with Sandbox.create(template=template) as sandbox:
+                result = sandbox.run_code("print('hello')")
+
         Args:
             timeout: Default timeout for code execution in seconds
             envs: Environment variables to set
             config: Sandbox configuration
             workspace_id: Optional workspace ID (auto-generated if not provided)
+            template: Optional template to use for sandbox configuration
 
         Returns:
             Sandbox instance
@@ -323,6 +796,7 @@ class Sandbox:
             envs=envs,
             config=config,
             workspace_id=workspace_id,
+            template=template,
         ))
 
     @classmethod
@@ -333,6 +807,7 @@ class Sandbox:
         config: Optional[SandboxConfig] = None,
         workspace_id: Optional[str] = None,
         external_workspace_path: Optional[str] = None,
+        template: Optional[Template] = None,
     ) -> "Sandbox":
         """
         Create a new sandbox instance (E2B-compatible).
@@ -343,6 +818,7 @@ class Sandbox:
             config: Sandbox configuration
             workspace_id: Optional workspace ID (auto-generated if not provided)
             external_workspace_path: For local mode, use this path directly (will create symlink)
+            template: Optional template to use for sandbox configuration
 
         Returns:
             Sandbox instance
@@ -350,12 +826,31 @@ class Sandbox:
         if config is None:
             config = SandboxConfig()
 
-        # Create manager
-        manager = SandboxManager(config=config)
-
         # Generate workspace ID if not provided
         if workspace_id is None:
             workspace_id = f"ws-{uuid.uuid4().hex[:12]}"
+
+        # If api_endpoint is configured, use remote sandbox
+        if config.api_endpoint:
+            # Create SDK for remote API
+            sdk = SandboxSDK(api_endpoint=config.api_endpoint)
+
+            # Create workspace on remote server
+            workspace = await sdk.create_workspace(workspace_id)
+            logger.info(f"Created remote sandbox with workspace: {workspace_id} at {config.api_endpoint}")
+
+            # Create remote sandbox instance
+            sandbox = RemoteSandbox(
+                workspace_id=workspace_id,
+                sdk=sdk,
+                workspace=workspace,
+                config=config,
+            )
+            cls._instances[workspace_id] = sandbox
+            return sandbox
+
+        # Create manager for local execution
+        manager = SandboxManager(config=config)
 
         # For local mode with external workspace, pass external_path to manager
         # Manager will create symlink instead of real directory
@@ -382,7 +877,27 @@ class Sandbox:
             manager=manager,
             workspace=workspace,
             config=config,
+            template=template,
         )
+
+        # Apply template files and environment variables
+        if template:
+            # Create files defined in template
+            for file_path, content in template.files.items():
+                try:
+                    sandbox.files.write(file_path, content)
+                except Exception as e:
+                    logger.warning(f"Failed to create template file {file_path}: {e}")
+
+            # Merge template environment variables
+            if template.env:
+                envs = envs or {}
+                envs.update(template.env)
+                sandbox._envs = envs
+
+        # Store environment variables
+        if envs:
+            sandbox._envs = envs
 
         # Store in instances
         cls._instances[workspace_id] = sandbox
@@ -398,6 +913,26 @@ class Sandbox:
     def commands(self) -> Commands:
         """Command execution (E2B-compatible)."""
         return self._commands
+
+    @property
+    def user(self) -> str:
+        """
+        Get the current user (E2B-compatible).
+
+        Returns:
+            The current user name
+        """
+        return self._user
+
+    @property
+    def workdir(self) -> str:
+        """
+        Get the current working directory (E2B-compatible).
+
+        Returns:
+            The current working directory path
+        """
+        return self._workdir
 
     def run_code(
         self,
@@ -553,6 +1088,142 @@ class Sandbox:
         except Exception as e:
             logger.warning(f"Error deleting workspace: {e}")
 
+    def set_timeout(self, timeout: int) -> None:
+        """
+        Set sandbox timeout (E2B-compatible).
+
+        Changes the sandbox timeout during runtime.
+        For local sandbox, this updates the config timeout value.
+
+        Args:
+            timeout: New timeout in seconds
+        """
+        self.config.default_timeout_sec = timeout
+        logger.info(f"Set sandbox timeout to {timeout}s")
+
+    def get_info(self) -> SandboxInfo:
+        """
+        Get sandbox information (E2B-compatible).
+
+        Returns:
+            SandboxInfo object with sandbox details
+        """
+        # Get workspace info from the workspace object
+        workspace = self.workspace
+
+        # Determine started_at from workspace
+        started_at = workspace.created_at if hasattr(workspace, 'created_at') else ""
+        last_used = workspace.last_used_at if hasattr(workspace, 'last_used_at') else None
+
+        return SandboxInfo(
+            sandbox_id=self.workspace_id,
+            template_id=None,
+            name=self.workspace_id,
+            metadata={
+                "workspace_id": self.workspace_id,
+                "host_path": workspace.host_path if hasattr(workspace, 'host_path') else "",
+                "guest_path": workspace.guest_path if hasattr(workspace, 'guest_path') else "/workspace",
+                "status": workspace.status if hasattr(workspace, 'status') else "ready",
+                "last_used_at": last_used,
+            },
+            started_at=started_at,
+            end_at=None,
+        )
+
+    def pause(self) -> PausedWorkspace:
+        """
+        Pause the sandbox and save its state (E2B-compatible).
+
+        Saves the workspace filesystem to a backup directory. The sandbox
+        can be resumed later to restore its state.
+
+        Returns:
+            PausedWorkspace object with backup information
+        """
+        return asyncio.run(self.pause_async())
+
+    async def pause_async(self) -> PausedWorkspace:
+        """
+        Pause the sandbox asynchronously (E2B-compatible).
+
+        Saves the workspace filesystem to a backup directory.
+
+        Returns:
+            PausedWorkspace object with backup information
+        """
+        paused_workspace = await self._manager.pause_workspace(self.workspace_id)
+        logger.info(f"Sandbox paused: {self.workspace_id}")
+        return paused_workspace
+
+    def resume(self, workspace_id: Optional[str] = None) -> "Sandbox":
+        """
+        Resume a paused sandbox (E2B-compatible).
+
+        Restores the workspace from its saved state. If workspace_id is provided,
+        it resumes that workspace; otherwise, resumes the current sandbox.
+
+        Args:
+            workspace_id: Optional workspace ID to resume (defaults to current sandbox's workspace_id)
+
+        Returns:
+            Sandbox instance with restored workspace
+        """
+        return asyncio.run(self.resume_async(workspace_id))
+
+    async def resume_async(self, workspace_id: Optional[str] = None) -> "Sandbox":
+        """
+        Resume a paused sandbox asynchronously (E2B-compatible).
+
+        Restores the workspace from its saved state.
+
+        Args:
+            workspace_id: Optional workspace ID to resume (defaults to current sandbox's workspace_id)
+
+        Returns:
+            Sandbox instance with restored workspace
+        """
+        target_workspace_id = workspace_id or self.workspace_id
+
+        # Resume the workspace
+        workspace = await self._manager.resume_workspace(target_workspace_id)
+        logger.info(f"Sandbox resumed: {target_workspace_id}")
+
+        # Update the current sandbox's workspace
+        self.workspace = workspace
+        return self
+
+    def get_metrics(self) -> List[SandboxMetrics]:
+        """
+        Get sandbox metrics (E2B-compatible).
+
+        Returns CPU and memory metrics for the sandbox.
+
+        Returns:
+            List of SandboxMetrics objects with timestamped metrics
+        """
+        return asyncio.run(self._get_metrics_async())
+
+    async def _get_metrics_async(self) -> List[SandboxMetrics]:
+        """
+        Get sandbox metrics asynchronously.
+
+        Returns CPU and memory metrics for the workspace.
+
+        Returns:
+            List of SandboxMetrics objects with timestamped metrics
+        """
+        # Collect current metrics
+        current_metrics = self._manager.collect_workspace_metrics(self.workspace_id)
+
+        # Get metrics history
+        metrics_history = self._manager.get_workspace_metrics(self.workspace_id)
+
+        # Ensure current metrics is in the history
+        if not metrics_history or metrics_history[-1].timestamp != current_metrics.timestamp:
+            metrics_history.append(current_metrics)
+
+        return metrics_history
+
     # Context manager support (E2B-compatible)
     def __enter__(self):
         """Synchronous context manager entry."""
@@ -576,6 +1247,42 @@ class Sandbox:
         return cls._instances.get(sandbox_id)
 
     @classmethod
-    def list(cls) -> List[str]:
-        """List all active sandbox IDs."""
+    def list(cls, state: Optional[str] = None) -> List[str]:
+        """
+        List all active sandbox IDs.
+
+        Args:
+            state: Optional filter by state ("running" or "paused")
+
+        Returns:
+            List of sandbox IDs
+        """
+        if state:
+            # Filter based on state
+            return list(cls._instances.keys())
         return list(cls._instances.keys())
+
+    @classmethod
+    async def list_paused_workspaces_async(cls) -> List[PausedWorkspace]:
+        """
+        List all paused workspaces.
+
+        Returns:
+            List of PausedWorkspace objects
+        """
+        # Get manager from any existing instance
+        if cls._instances:
+            sandbox = next(iter(cls._instances.values()))
+            if hasattr(sandbox, '_manager'):
+                return await sandbox._manager.list_paused_workspaces()
+        return []
+
+    @classmethod
+    def list_paused_workspaces(cls) -> List[PausedWorkspace]:
+        """
+        List all paused workspaces synchronously.
+
+        Returns:
+            List of PausedWorkspace objects
+        """
+        return asyncio.run(cls.list_paused_workspaces_async())

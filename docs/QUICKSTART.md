@@ -65,6 +65,35 @@ print(content)
 sandbox.kill()
 ```
 
+### 4. Remote API Usage
+
+You can use ds-sandbox on a remote machine via REST API. The API is unified - same interface as local usage.
+
+**On the remote machine:**
+```bash
+# 1. Install ds-sandbox
+pip install ds-sandbox
+
+# 2. Start the API server
+ds-sandbox-api --host 0.0.0.0 --port 8000
+```
+
+**On the local machine (same interface as local):**
+```python
+from ds_sandbox import Sandbox, SandboxConfig
+
+# Connect to remote API server (same usage as local!)
+sandbox = Sandbox.create(
+    config=SandboxConfig(api_endpoint="http://REMOTE_MACHINE_IP:8000")
+)
+
+# Execute code (runs in remote Docker container)
+result = sandbox.run_code("print('hello world')")
+print(result.stdout)
+
+sandbox.kill()
+```
+
 ## Two Modes Detailed
 
 ### Local Mode
@@ -84,6 +113,7 @@ sandbox.kill()
 **Characteristics**:
 - Fast execution (no container overhead)
 - Shared filesystem with host
+- Environment is consistent with local environment (uses the same Python and packages)
 - Suitable for local development and testing
 
 ### Docker Mode

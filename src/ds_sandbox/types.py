@@ -14,7 +14,11 @@ __all__ = [
     "Workspace",
     "DatasetInfo",
     "CodeScanResult",
-    "SandboxConfig",
+    "SandboxInfo",
+    "Template",
+    "SandboxEvent",
+    "PausedWorkspace",
+    "SandboxMetrics",
 ]
 
 
@@ -289,66 +293,257 @@ class CodeIssue(BaseModel):
     module: Optional[str] = Field(None, description="Related module")
 
 
-class SandboxConfig(BaseModel):
-    """Sandbox configuration"""
+class SandboxInfo(BaseModel):
+    """
+    Sandbox information (E2B-compatible).
 
-    # Backend selection
-    default_backend: Literal["docker", "local", "firecracker", "kata", "auto"] = Field(
-        default="auto",
-        description="Default backend"
+    This is returned by Sandbox.get_info() to provide details about the sandbox.
+    """
+
+    sandbox_id: str = Field(..., description="Unique sandbox identifier")
+
+    template_id: Optional[str] = Field(None, description="Template ID used to create the sandbox")
+
+    name: Optional[str] = Field(None, description="Sandbox name")
+
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional metadata"
     )
 
-    default_isolation: Literal["auto", "fast", "secure"] = Field(
-        default="auto",
-        description="Default isolation level"
+    started_at: str = Field(..., description="Sandbox start timestamp (ISO 8601)")
+
+    end_at: Optional[str] = Field(None, description="Sandbox end timestamp (ISO 8601)")
+
+
+class Template(BaseModel):
+    """
+    E2B-compatible Template for custom sandbox configurations.
+
+    Templates allow defining custom sandboxes with specific configurations
+    including base image, environment variables, files, and startup commands.
+
+    Usage:
+        >>> from ds_sandbox import Template, Sandbox
+        >>>
+        >>> # Create a template
+        >>> template = Template(
+        ...     id="my-custom-template",
+        ...     name="My Custom Template",
+        ...     env={"CUSTOM_VAR": "value"},
+        ...     files={"setup.sh": "#!/bin/bash\\necho 'Hello'"},
+        ...     cmd=["bash", "/home/user/setup.sh"],
+        ... )
+        >>>
+        >>> # Use the template when creating a sandbox
+        >>> sandbox = Sandbox.create(template=template)
+    """
+
+    id: str = Field(..., description="Template identifier")
+
+    name: Optional[str] = Field(None, description="Template name")
+
+    description: Optional[str] = Field(None, description="Template description")
+
+    # Base image (for Docker-based backends)
+    image: Optional[str] = Field(None, description="Docker image to use")
+
+    # Environment variables
+    env: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Environment variables to set in the sandbox"
     )
 
-    # Jupyter execution (for chart support)
-    use_jupyter: bool = Field(
-        default=False,
-        description="Use Jupyter kernel for code execution (enables chart capture like E2B)"
+    # Files to copy into the sandbox
+    files: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Files to create in the sandbox (path -> content)"
     )
 
-    # Workspace management
-    workspace_base_dir: str = Field(
-        default="/opt/workspaces",
-        description="Base directory for workspaces"
+    # Commands to run on startup
+    cmd: List[str] = Field(
+        default_factory=list,
+        description="Commands to run on startup"
     )
 
-    workspace_retention_days: int = Field(
-        default=30,
+    # Start command (overrides default)
+    start_cmd: Optional[str] = Field(
+        None,
+        description="Command to start the sandbox (for persistent backends)"
+    )
+
+    # Ready command to check if sandbox is ready
+    ready_cmd: Optional[str] = Field(
+        None,
+        description="Command to check if sandbox is ready"
+    )
+
+    # Ready command timeout in seconds
+    ready_timeout: int = Field(
+        default=20,
         ge=1,
-        le=365,
-        description="Workspace retention before cleanup"
+        le=300,
+        description="Timeout for ready command in seconds"
     )
 
-    # Dataset management
-    dataset_registry_dir: str = Field(
-        default="/opt/datasets",
-        description="Central dataset registry directory"
+    # Default user
+    user: Optional[str] = Field(
+        None,
+        description="Default user for the sandbox"
     )
 
-    default_dataset_strategy: Literal["copy", "link"] = Field(
-        default="copy",
-        description="Default dataset preparation strategy"
+    # Default working directory
+    workdir: Optional[str] = Field(
+        None,
+        description="Default working directory"
     )
 
-    # Security defaults
-    default_network_policy: Literal["disabled", "whitelist"] = Field(
-        default="disabled",
-        description="Default network access policy"
-    )
-
-    default_timeout_sec: int = Field(
-        default=3600,
+    # CPU count
+    cpu_count: int = Field(
+        default=2,
         ge=1,
-        le=86400,
-        description="Default timeout (seconds)"
+        le=16,
+        description="Number of CPU cores"
     )
 
-    default_memory_mb: int = Field(
-        default=4096,
-        ge=512,
+    # Memory in MB
+    memory_mb: int = Field(
+        default=2048,
+        ge=256,
         le=65536,
-        description="Default memory limit (MB)"
+        description="Memory in MB"
     )
+
+    # Files to copy (as list of dicts with src/dest)
+    copy_files: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="Files to copy into template (list of {src, dest} dicts)"
+    )
+
+    # Commands to run during build
+    run_cmds: List[str] = Field(
+        default_factory=list,
+        description="Commands to run during build"
+    )
+
+    # Template aliases for easy referencing
+    aliases: List[str] = Field(
+        default_factory=list,
+        description="Template aliases for easy referencing"
+    )
+
+    # Skip cache during build
+    skip_cache: bool = Field(
+        default=False,
+        description="Skip cache during build"
+    )
+
+    # Metadata
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional template metadata"
+    )
+
+
+class SandboxEvent(BaseModel):
+    """
+    E2B-compatible Sandbox Event model.
+
+    Represents lifecycle events for sandboxes (workspaces) including
+    creation, updates, and deletion events.
+
+    Example:
+        >>> event = SandboxEvent(
+        ...     id="evt-123456",
+        ...     type="sandbox.lifecycle.created",
+        ...     event_data={"timeout": 3600},
+        ...     sandbox_id="sandbox-abc",
+        ...     workspace_id="my-workspace",
+        ...     timestamp="2024-01-01T12:00:00Z"
+        ... )
+    """
+
+    id: str = Field(..., description="Event ID (UUID)")
+
+    type: str = Field(
+        ...,
+        description="Event type (e.g., sandbox.lifecycle.created, sandbox.lifecycle.updated, sandbox.lifecycle.killed)"
+    )
+
+    event_data: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Event data (can contain set_timeout, etc.)"
+    )
+
+    sandbox_id: str = Field(..., description="Sandbox ID")
+
+    workspace_id: str = Field(..., description="Workspace ID")
+
+    timestamp: str = Field(..., description="ISO 8601 timestamp")
+
+
+class PausedWorkspace(BaseModel):
+    """
+    Paused workspace metadata.
+
+    Represents a paused sandbox workspace with its saved state information.
+    Paused workspaces can be resumed to restore the filesystem and runtime state.
+
+    Example:
+        >>> paused = PausedWorkspace(
+        ...     workspace_id="my-workspace",
+        ...     backup_path="/opt/paused/my-workspace-20240101",
+        ...     original_path="/opt/workspaces/my-workspace",
+        ...     paused_at="2024-01-01T12:00:00Z",
+        ...     expires_at="2024-01-31T12:00:00Z",
+        ...     files_count=42,
+        ...     size_mb=128.5
+        ... )
+    """
+
+    workspace_id: str = Field(..., description="Original workspace ID")
+
+    backup_path: str = Field(..., description="Path where workspace state is stored")
+
+    original_path: str = Field(..., description="Original workspace path before pause")
+
+    paused_at: str = Field(..., description="ISO 8601 timestamp when workspace was paused")
+
+    expires_at: str = Field(..., description="ISO 8601 timestamp when paused state expires (30 days default)")
+
+    files_count: int = Field(default=0, description="Number of files in the paused workspace")
+
+    size_mb: float = Field(default=0.0, description="Size of paused workspace in MB")
+
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional metadata about the paused workspace"
+    )
+
+
+class SandboxMetrics(BaseModel):
+    """
+    E2B-compatible Sandbox Metrics model.
+
+    Represents CPU and memory metrics for a sandbox workspace at a specific point in time.
+
+    Example:
+        >>> metrics = SandboxMetrics(
+        ...     cpu_count=4,
+        ...     cpu_used_pct=25.5,
+        ...     mem_total_mib=8192,
+        ...     mem_used_mib=2048,
+        ...     timestamp="2024-01-01T12:00:00Z"
+        ... )
+    """
+
+    cpu_count: int = Field(..., description="Number of CPU cores")
+
+    cpu_used_pct: float = Field(..., description="CPU usage percentage (0-100)")
+
+    mem_total_mib: int = Field(..., description="Total memory in MiB")
+
+    mem_used_mib: int = Field(..., description="Used memory in MiB")
+
+    timestamp: str = Field(..., description="ISO 8601 timestamp of the metrics snapshot")
+

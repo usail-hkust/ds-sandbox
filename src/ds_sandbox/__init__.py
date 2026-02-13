@@ -17,13 +17,33 @@ from ds_sandbox.types import (
     Workspace,
     DatasetInfo,
     CodeScanResult,
-    SandboxConfig as SandboxConfigTypes,
+    SandboxInfo,
+    Template,
+    SandboxEvent,
+    PausedWorkspace,
+    SandboxMetrics,
 )
+from ds_sandbox.template import TemplateBuilder, BuildOptions
 from ds_sandbox.api.rest import create_app, app, SandboxErrorResponse
 from ds_sandbox.api.sdk import SandboxSDK, ExecutionStatus, ExecutionLogs
 
 # E2B-compatible Sandbox class
 from ds_sandbox.sandbox import Sandbox
+
+# E2B-compatible exception classes
+from ds_sandbox.errors import (
+    SandboxError,
+    WorkspaceNotFoundError,
+    DatasetNotFoundError,
+    DatasetNotPreparedError,
+    ExecutionTimeoutError,
+    ExecutionFailedError,
+    ExecutionNotFoundError,
+    ResourceLimitError,
+    BackendUnavailableError,
+    SecurityScanFailedError,
+    InvalidRequestError,
+)
 
 # Re-export core classes
 __all__ = [
@@ -34,7 +54,15 @@ __all__ = [
     "Workspace",
     "DatasetInfo",
     "CodeScanResult",
-    "SandboxConfigTypes",
+    "SandboxInfo",
+    "Template",
+    "SandboxEvent",
+    "PausedWorkspace",
+    "SandboxMetrics",
+    # Template builder
+    "TemplateBuilder",
+    "BuildOptions",
+    # API exports
     "create_app",
     "app",
     "SandboxErrorResponse",
@@ -44,4 +72,16 @@ __all__ = [
     "ExecutionLogs",
     # E2B-compatible API
     "Sandbox",
+    # Exception classes
+    "SandboxError",
+    "WorkspaceNotFoundError",
+    "DatasetNotFoundError",
+    "DatasetNotPreparedError",
+    "ExecutionTimeoutError",
+    "ExecutionFailedError",
+    "ExecutionNotFoundError",
+    "ResourceLimitError",
+    "BackendUnavailableError",
+    "SecurityScanFailedError",
+    "InvalidRequestError",
 ]

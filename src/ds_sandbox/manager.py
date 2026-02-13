@@ -33,6 +33,10 @@ from ds_sandbox.types import (
     ExecutionRequest,
     ExecutionResult,
     Workspace,
+    SandboxEvent,
+    PausedWorkspace,
+    SandboxMetrics,
+    Template,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,9 +79,25 @@ class SandboxManager:
         self._workspace_cache: Dict[str, Workspace] = {}
         self._execution_store: Dict[str, Dict[str, Any]] = {}
         self._metrics = InMemoryMetricsCollector()
+        self._events: List[SandboxEvent] = []
+        self._paused_workspaces: Dict[str, PausedWorkspace] = {}
+        self._metrics_history: Dict[str, List[SandboxMetrics]] = {}
+        self._templates: Dict[str, Template] = {}
+        self._template_aliases: Dict[str, str] = {}  # alias -> template_id
+
+        # Ensure paused workspaces directory exists
+        self._paused_dir = Path(config.paused_workspaces_base_dir)
+        self._paused_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure templates directory exists
+        self._templates_dir = Path(config.workspace_base_dir).parent / "templates"
+        self._templates_dir.mkdir(parents=True, exist_ok=True)
 
         # Load default backends
         self.load_backends_from_registry()
+
+        # Load existing templates from disk
+        self._load_templates()
 
         logger.info(f"SandboxManager initialized with config: default_backend={config.default_backend}")
 
@@ -399,6 +419,148 @@ class SandboxManager:
         """
         return self._metrics.snapshot()
 
+    def get_workspace_metrics(self, workspace_id: str) -> List[SandboxMetrics]:
+        """
+        Get metrics history for a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Returns:
+            List of SandboxMetrics objects
+        """
+        return self._metrics_history.get(workspace_id, [])
+
+    def get_system_metrics(self) -> List[SandboxMetrics]:
+        """
+        Get all system metrics across all workspaces.
+
+        Returns:
+            List of all SandboxMetrics objects
+        """
+        all_metrics = []
+        for metrics_list in self._metrics_history.values():
+            all_metrics.extend(metrics_list)
+        # Return sorted by timestamp
+        all_metrics.sort(key=lambda m: m.timestamp)
+        return all_metrics
+
+    def collect_workspace_metrics(self, workspace_id: str) -> SandboxMetrics:
+        """
+        Collect current metrics for a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Returns:
+            SandboxMetrics object with current metrics
+        """
+        import psutil
+
+        # Get CPU count
+        cpu_count = psutil.cpu_count() or 1
+
+        # Get CPU usage (percentage over 0.1 second interval)
+        cpu_used_pct = psutil.cpu_percent(interval=0.1)
+
+        # Get memory info
+        mem = psutil.virtual_memory()
+        mem_total_mib = int(mem.total / (1024 * 1024))
+        mem_used_mib = int(mem.used / (1024 * 1024))
+
+        # Get current timestamp
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Create metrics object
+        metrics = SandboxMetrics(
+            cpu_count=cpu_count,
+            cpu_used_pct=cpu_used_pct,
+            mem_total_mib=mem_total_mib,
+            mem_used_mib=mem_used_mib,
+            timestamp=timestamp,
+        )
+
+        # Store in history
+        if workspace_id not in self._metrics_history:
+            self._metrics_history[workspace_id] = []
+
+        # Keep only last 100 metrics per workspace
+        if len(self._metrics_history[workspace_id]) >= 100:
+            self._metrics_history[workspace_id] = self._metrics_history[workspace_id][-99:]
+
+        self._metrics_history[workspace_id].append(metrics)
+
+        return metrics
+
+    # =========================================================================
+    # Event Management
+    # =========================================================================
+
+    def emit_event(
+        self,
+        event_type: str,
+        workspace_id: str,
+        event_data: Optional[Dict[str, Any]] = None,
+    ) -> SandboxEvent:
+        """
+        Emit a sandbox lifecycle event.
+
+        Args:
+            event_type: Type of event (e.g., "sandbox.lifecycle.created")
+            workspace_id: Workspace ID
+            event_data: Additional event data
+
+        Returns:
+            The created SandboxEvent
+        """
+        event = SandboxEvent(
+            id=f"evt-{uuid.uuid4().hex[:12]}",
+            type=event_type,
+            event_data=event_data or {},
+            sandbox_id=f"sandbox-{workspace_id}",
+            workspace_id=workspace_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        self._events.append(event)
+        logger.info(f"Event emitted: {event_type} for workspace {workspace_id}")
+        return event
+
+    def get_events(
+        self,
+        workspace_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[SandboxEvent]:
+        """
+        Get sandbox lifecycle events.
+
+        Args:
+            workspace_id: Optional workspace ID to filter events
+            limit: Maximum number of events to return (default: 10)
+
+        Returns:
+            List of SandboxEvent objects
+        """
+        events = self._events
+
+        if workspace_id:
+            events = [e for e in events if e.workspace_id == workspace_id]
+
+        # Return most recent events (last N)
+        return events[-limit:] if len(events) > limit else events
+
+    def get_all_events(self, limit: int = 100) -> List[SandboxEvent]:
+        """
+        Get all sandbox lifecycle events (admin endpoint).
+
+        Args:
+            limit: Maximum number of events to return (default: 100)
+
+        Returns:
+            List of all SandboxEvent objects
+        """
+        # Return most recent events (last N)
+        return self._events[-limit:] if len(self._events) > limit else self._events
+
     async def create_workspace(
         self,
         workspace_id: str,
@@ -484,6 +646,13 @@ class SandboxManager:
             # Cache workspace
             self._workspace_cache[workspace_id] = workspace
             self._metrics.record_workspace_created(workspace_id)
+
+            # Emit lifecycle event
+            self.emit_event(
+                event_type="sandbox.lifecycle.created",
+                workspace_id=workspace_id,
+                event_data={"host_path": str(workspace_path), "guest_path": "/workspace"},
+            )
 
             logger.info(f"Workspace '{workspace_id}' created successfully")
 
@@ -579,6 +748,13 @@ class SandboxManager:
             else:
                 shutil.rmtree(workspace_path)
 
+            # Emit lifecycle event
+            self.emit_event(
+                event_type="sandbox.lifecycle.killed",
+                workspace_id=workspace_id,
+                event_data={"host_path": str(workspace_path)},
+            )
+
             logger.info(f"Workspace '{workspace_id}' deleted successfully")
             self._metrics.record_workspace_deleted(workspace_id)
 
@@ -613,9 +789,15 @@ class SandboxManager:
 
         return health_status
 
-    async def list_workspaces(self) -> List[Workspace]:
+    async def list_workspaces(
+        self,
+        state: Optional[str] = None,
+    ) -> List[Workspace]:
         """
         List all existing workspaces.
+
+        Args:
+            state: Optional filter by state ("running" or "paused")
 
         Returns:
             List of Workspace objects
@@ -630,7 +812,18 @@ class SandboxManager:
             if entry.is_dir():
                 try:
                     workspace = await self.get_workspace(entry.name)
-                    workspaces.append(workspace)
+                    # Filter by state if specified
+                    if state == "paused":
+                        # Check if workspace is in paused list
+                        if workspace.workspace_id in self._paused_workspaces:
+                            workspaces.append(workspace)
+                    elif state == "running":
+                        # Only include if not paused
+                        if workspace.workspace_id not in self._paused_workspaces:
+                            workspaces.append(workspace)
+                    else:
+                        # No filter, include all
+                        workspaces.append(workspace)
                 except WorkspaceNotFoundError:
                     continue
 
@@ -657,6 +850,236 @@ class SandboxManager:
                     cleaned += 1
 
         logger.info(f"Cleaned up {cleaned} expired workspaces")
+        return cleaned
+
+    # =========================================================================
+    # Workspace Pause/Resume (E2B-compatible)
+    # =========================================================================
+
+    async def pause_workspace(self, workspace_id: str) -> PausedWorkspace:
+        """
+        Pause a workspace and save its state.
+
+        Saves the workspace filesystem to a backup directory. The paused workspace
+        can be resumed later to restore its state.
+
+        Args:
+            workspace_id: Workspace ID to pause
+
+        Returns:
+            PausedWorkspace object with backup information
+
+        Raises:
+            WorkspaceNotFoundError: If workspace doesn't exist
+        """
+        from datetime import timedelta
+
+        workspace = await self.get_workspace(workspace_id)
+        workspace_path = Path(workspace.host_path)
+
+        if not workspace_path.exists():
+            raise WorkspaceNotFoundError(workspace_id=workspace_id)
+
+        # Create backup directory with timestamp
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_dir = self._paused_dir / f"{workspace_id}-{timestamp}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Pausing workspace {workspace_id}, backing up to {backup_dir}")
+
+        # Copy workspace files to backup directory
+        import shutil as _shutil
+        file_count = 0
+        total_size = 0
+
+        if workspace_path.exists():
+            for item in workspace_path.rglob("*"):
+                if item.is_file():
+                    rel_path = item.relative_to(workspace_path)
+                    dest_path = backup_dir / rel_path
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    _shutil.copy2(item, dest_path)
+                    file_count += 1
+                    total_size += item.stat().st_size
+
+        # Calculate expiry date (30 days by default)
+        paused_at = datetime.now(timezone.utc)
+        expires_at = paused_at + timedelta(days=self.config.paused_workspace_retention_days)
+
+        # Create paused workspace metadata
+        paused_workspace = PausedWorkspace(
+            workspace_id=workspace_id,
+            backup_path=str(backup_dir),
+            original_path=str(workspace_path),
+            paused_at=paused_at.isoformat(),
+            expires_at=expires_at.isoformat(),
+            files_count=file_count,
+            size_mb=total_size / (1024 * 1024),
+            metadata={
+                "original_host_path": workspace.host_path,
+                "original_guest_path": workspace.guest_path,
+                "original_subdirs": workspace.subdirs,
+            }
+        )
+
+        # Store in memory
+        self._paused_workspaces[workspace_id] = paused_workspace
+
+        # Emit lifecycle event
+        self.emit_event(
+            event_type="sandbox.lifecycle.paused",
+            workspace_id=workspace_id,
+            event_data={
+                "backup_path": str(backup_dir),
+                "files_count": file_count,
+                "size_mb": total_size / (1024 * 1024),
+            },
+        )
+
+        logger.info(f"Workspace {workspace_id} paused successfully: {file_count} files, {total_size / (1024 * 1024):.2f} MB")
+        return paused_workspace
+
+    async def resume_workspace(self, workspace_id: str) -> Workspace:
+        """
+        Resume a paused workspace from saved state.
+
+        Restores the workspace from its backup directory to the original location.
+
+        Args:
+            workspace_id: Workspace ID to resume (must be paused)
+
+        Returns:
+            Workspace object with restored information
+
+        Raises:
+            WorkspaceNotFoundError: If paused workspace doesn't exist
+        """
+        if workspace_id not in self._paused_workspaces:
+            raise WorkspaceNotFoundError(workspace_id=workspace_id)
+
+        paused_workspace = self._paused_workspaces[workspace_id]
+        backup_path = Path(paused_workspace.backup_path)
+        original_path = Path(paused_workspace.original_path)
+
+        if not backup_path.exists():
+            raise WorkspaceNotFoundError(workspace_id=workspace_id)
+
+        logger.info(f"Resuming workspace {workspace_id} from {backup_path}")
+
+        # Restore files from backup
+        import shutil as _shutil
+
+        # Remove original workspace if it exists
+        if original_path.exists() or original_path.is_symlink():
+            if original_path.is_symlink():
+                original_path.unlink()
+            else:
+                _shutil.rmtree(original_path)
+
+        # Recreate original directory
+        original_path.mkdir(parents=True, exist_ok=True)
+
+        # Copy files from backup
+        for item in backup_path.rglob("*"):
+            if item.is_file():
+                rel_path = item.relative_to(backup_path)
+                dest_path = original_path / rel_path
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                _shutil.copy2(item, dest_path)
+
+        # Ensure .workspace metadata file exists
+        metadata_path = original_path / ".workspace"
+        if not metadata_path.exists():
+            metadata_path.touch()
+
+        # Remove from paused workspaces
+        del self._paused_workspaces[workspace_id]
+
+        # Emit lifecycle event
+        self.emit_event(
+            event_type="sandbox.lifecycle.resumed",
+            workspace_id=workspace_id,
+            event_data={"original_path": str(original_path)},
+        )
+
+        # Get or create workspace object
+        workspace = await self.get_workspace(workspace_id)
+        logger.info(f"Workspace {workspace_id} resumed successfully")
+
+        return workspace
+
+    async def get_paused_workspace(self, workspace_id: str) -> PausedWorkspace:
+        """
+        Get paused workspace metadata.
+
+        Args:
+            workspace_id: Workspace ID
+
+        Returns:
+            PausedWorkspace object
+
+        Raises:
+            WorkspaceNotFoundError: If workspace is not paused
+        """
+        if workspace_id not in self._paused_workspaces:
+            raise WorkspaceNotFoundError(workspace_id=workspace_id)
+
+        return self._paused_workspaces[workspace_id]
+
+    async def list_paused_workspaces(self) -> List[PausedWorkspace]:
+        """
+        List all paused workspaces.
+
+        Returns:
+            List of PausedWorkspace objects
+        """
+        return list(self._paused_workspaces.values())
+
+    async def delete_paused_workspace(self, workspace_id: str) -> None:
+        """
+        Delete a paused workspace backup.
+
+        Args:
+            workspace_id: Workspace ID
+
+        Raises:
+            WorkspaceNotFoundError: If workspace is not paused
+        """
+        if workspace_id not in self._paused_workspaces:
+            raise WorkspaceNotFoundError(workspace_id=workspace_id)
+
+        paused_workspace = self._paused_workspaces[workspace_id]
+        backup_path = Path(paused_workspace.backup_path)
+
+        # Remove backup directory
+        if backup_path.exists():
+            import shutil as _shutil
+            _shutil.rmtree(backup_path)
+
+        # Remove from memory
+        del self._paused_workspaces[workspace_id]
+
+        logger.info(f"Paused workspace {workspace_id} deleted")
+
+    async def cleanup_expired_paused_workspaces(self) -> int:
+        """
+        Remove paused workspaces that have exceeded retention period.
+
+        Returns:
+            Number of paused workspaces cleaned up
+        """
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        cleaned = 0
+
+        for workspace_id, paused_workspace in list(self._paused_workspaces.items()):
+            expires_at = datetime.fromisoformat(paused_workspace.expires_at.replace("Z", "+00:00"))
+            if expires_at < now:
+                await self.delete_paused_workspace(workspace_id)
+                cleaned += 1
+
+        logger.info(f"Cleaned up {cleaned} expired paused workspaces")
         return cleaned
 
     async def _prepare_datasets(
@@ -788,6 +1211,177 @@ class SandboxManager:
             return scan_result.recommended_backend
 
         return request.mode
+
+    # =========================================================================
+    # Template Management
+    # =========================================================================
+
+    def _load_templates(self) -> None:
+        """Load templates from disk"""
+        import json
+
+        if not self._templates_dir.exists():
+            return
+
+        for template_file in self._templates_dir.glob("*.json"):
+            try:
+                with open(template_file, "r") as f:
+                    template_data = json.load(f)
+                    template = Template(**template_data)
+                    self._templates[template.id] = template
+
+                    # Register aliases
+                    for alias in template.aliases:
+                        self._template_aliases[alias] = template.id
+
+                    logger.debug(f"Loaded template: {template.id}")
+            except Exception as e:
+                logger.warning(f"Failed to load template from {template_file}: {e}")
+
+    def _save_template(self, template: Template) -> None:
+        """Save template to disk"""
+        import json
+
+        template_file = self._templates_dir / f"{template.id}.json"
+        with open(template_file, "w") as f:
+            json.dump(template.model_dump(), f, indent=2)
+        logger.debug(f"Saved template: {template.id}")
+
+    async def build_template(
+        self,
+        template: Template,
+        alias: Optional[str] = None,
+        wait_timeout: int = 60,
+        debug: bool = False,
+    ) -> Template:
+        """
+        Build a template.
+
+        This method stores the template configuration and optionally builds
+        the actual Docker image if the backend supports it.
+
+        Args:
+            template: Template configuration
+            alias: Primary alias for the template
+            wait_timeout: Wait timeout in seconds
+            debug: Enable debug mode
+
+        Returns:
+            Template object with assigned ID
+
+        Example:
+            >>> from ds_sandbox.template import TemplateBuilder
+            >>> template = (TemplateBuilder()
+            ...     .from_python_image("3.11")
+            ...     .set_envs({"MY_VAR": "value"})
+            ...     .build("my-template"))
+            >>> manager = SandboxManager()
+            >>> result = await manager.build_template(template)
+        """
+        # Set alias if provided
+        if alias:
+            if alias not in template.aliases:
+                template.aliases.insert(0, alias)
+
+        # Store template in memory
+        self._templates[template.id] = template
+
+        # Register aliases
+        for template_alias in template.aliases:
+            self._template_aliases[template_alias] = template.id
+
+        # Save to disk
+        self._save_template(template)
+
+        # Emit lifecycle event
+        self.emit_event(
+            event_type="template.built",
+            workspace_id="",
+            event_data={
+                "template_id": template.id,
+                "alias": alias,
+                "image": template.image,
+                "debug": debug,
+            },
+        )
+
+        logger.info(f"Template built: {template.id}")
+        return template
+
+    async def list_templates(self) -> List[Template]:
+        """
+        List all available templates.
+
+        Returns:
+            List of Template objects
+
+        Example:
+            >>> templates = await manager.list_templates()
+            >>> for t in templates:
+            ...     print(f"{t.id}: {t.name}")
+        """
+        return list(self._templates.values())
+
+    async def get_template(self, template_id: str) -> Template:
+        """
+        Get template by ID or alias.
+
+        Args:
+            template_id: Template ID or alias
+
+        Returns:
+            Template object
+
+        Raises:
+            SandboxError: If template not found
+        """
+        # Try direct ID first
+        if template_id in self._templates:
+            return self._templates[template_id]
+
+        # Try alias lookup
+        if template_id in self._template_aliases:
+            actual_id = self._template_aliases[template_id]
+            return self._templates[actual_id]
+
+        raise SandboxError(
+            message=f"Template not found: {template_id}",
+            error_code="TEMPLATE_NOT_FOUND",
+        )
+
+    async def delete_template(self, template_id: str) -> None:
+        """
+        Delete a template.
+
+        Args:
+            template_id: Template ID to delete
+
+        Raises:
+            SandboxError: If template not found
+        """
+        # Get template to remove aliases
+        template = await self.get_template(template_id)
+
+        # Remove from memory
+        del self._templates[template_id]
+
+        # Remove aliases
+        for alias in template.aliases:
+            self._template_aliases.pop(alias, None)
+
+        # Remove from disk
+        template_file = self._templates_dir / f"{template_id}.json"
+        if template_file.exists():
+            template_file.unlink()
+
+        # Emit lifecycle event
+        self.emit_event(
+            event_type="template.deleted",
+            workspace_id="",
+            event_data={"template_id": template_id},
+        )
+
+        logger.info(f"Template deleted: {template_id}")
 
 
 class IsolationRouter:

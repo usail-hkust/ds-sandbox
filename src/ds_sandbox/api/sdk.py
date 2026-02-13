@@ -37,8 +37,9 @@ from ds_sandbox.errors import (
     SandboxError,
     ExecutionTimeoutError,
     ExecutionFailedError,
+    WorkspaceNotFoundError,
 )
-from ds_sandbox.types import ExecutionResult, Workspace, DatasetInfo
+from ds_sandbox.types import ExecutionResult, Workspace, DatasetInfo, SandboxInfo, SandboxEvent, PausedWorkspace, SandboxMetrics, Template
 
 logger = logging.getLogger(__name__)
 
@@ -330,9 +331,12 @@ class SandboxSDK:
         await self._request("DELETE", f"/v1/workspaces/{workspace_id}")
         logger.info(f"Workspace deleted: {workspace_id}")
 
-    async def list_workspaces(self) -> List[Workspace]:
+    async def list_workspaces(self, state: Optional[str] = None) -> List[Workspace]:
         """
         List all workspaces.
+
+        Args:
+            state: Optional filter by state ("running" or "paused")
 
         Returns:
             List of Workspace objects
@@ -343,8 +347,249 @@ class SandboxSDK:
             ...     print(f"{ws.workspace_id}: {ws.status}")
         """
         logger.debug("Listing workspaces")
-        data = await self._request("GET", "/v1/workspaces")
+        params = {}
+        if state:
+            params["state"] = state
+        data = await self._request("GET", "/v1/workspaces", params=params)
         return [Workspace(**item) for item in data]
+
+    # =========================================================================
+    # Workspace Pause/Resume (E2B-compatible)
+    # =========================================================================
+
+    async def pause_workspace(self, workspace_id: str) -> PausedWorkspace:
+        """
+        Pause a workspace and save its state.
+
+        Saves the workspace filesystem to a backup directory. The paused workspace
+        can be resumed later to restore its state.
+
+        Args:
+            workspace_id: Workspace identifier to pause
+
+        Returns:
+            PausedWorkspace object with backup information
+
+        Example:
+            >>> paused = await sdk.pause_workspace("my-experiment")
+            >>> print(paused.backup_path)
+            /opt/paused/my-experiment-20240101
+        """
+        logger.info(f"Pausing workspace: {workspace_id}")
+        data = await self._request("POST", f"/v1/workspaces/{workspace_id}/pause")
+        paused_workspace = PausedWorkspace(**data)
+        logger.info(f"Workspace paused: {workspace_id}")
+        return paused_workspace
+
+    async def resume_workspace(self, workspace_id: str) -> Workspace:
+        """
+        Resume a paused workspace from saved state.
+
+        Restores the workspace from its backup directory to the original location.
+
+        Args:
+            workspace_id: Workspace identifier to resume
+
+        Returns:
+            Workspace object with restored information
+
+        Example:
+            >>> workspace = await sdk.resume_workspace("my-experiment")
+            >>> print(workspace.status)
+            ready
+        """
+        logger.info(f"Resuming workspace: {workspace_id}")
+        data = await self._request("POST", f"/v1/workspaces/{workspace_id}/resume")
+        workspace = Workspace(**data)
+        logger.info(f"Workspace resumed: {workspace_id}")
+        return workspace
+
+    async def get_paused_workspace(self, workspace_id: str) -> PausedWorkspace:
+        """
+        Get paused workspace information.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Returns:
+            PausedWorkspace object with paused state information
+
+        Example:
+            >>> paused = await sdk.get_paused_workspace("my-experiment")
+            >>> print(paused.paused_at)
+            2024-01-01T12:00:00+00:00
+        """
+        logger.debug(f"Getting paused workspace: {workspace_id}")
+        data = await self._request("GET", f"/v1/workspaces/{workspace_id}/pause")
+        return PausedWorkspace(**data)
+
+    async def list_paused_workspaces(self) -> List[PausedWorkspace]:
+        """
+        List all paused workspaces.
+
+        Returns:
+            List of PausedWorkspace objects
+
+        Example:
+            >>> paused_list = await sdk.list_paused_workspaces()
+            >>> for pw in paused_list:
+            ...     print(f"{pw.workspace_id}: {pw.size_mb} MB")
+        """
+        logger.debug("Listing paused workspaces")
+        data = await self._request("GET", "/v1/workspaces/paused")
+        return [PausedWorkspace(**item) for item in data]
+
+    async def delete_paused_workspace(self, workspace_id: str) -> None:
+        """
+        Delete a paused workspace backup.
+
+        Removes the paused workspace backup without affecting any existing workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Example:
+            >>> await sdk.delete_paused_workspace("my-experiment")
+        """
+        logger.info(f"Deleting paused workspace: {workspace_id}")
+        await self._request("DELETE", f"/v1/workspaces/{workspace_id}/pause")
+        logger.info(f"Paused workspace deleted: {workspace_id}")
+
+    async def get_sandbox_info(self, workspace_id: str) -> SandboxInfo:
+        """
+        Get sandbox information.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Returns:
+            SandboxInfo object with sandbox details
+
+        Example:
+            >>> info = await sdk.get_sandbox_info("my-experiment")
+            >>> print(info.sandbox_id, info.started_at)
+        """
+        logger.debug(f"Getting sandbox info: {workspace_id}")
+        data = await self._request("GET", f"/v1/workspaces/{workspace_id}/info")
+        return SandboxInfo(**data)
+
+    async def set_timeout(self, workspace_id: str, timeout: int) -> Dict[str, Any]:
+        """
+        Set sandbox timeout.
+
+        Args:
+            workspace_id: Workspace identifier
+            timeout: New timeout in seconds
+
+        Returns:
+            Response with status
+
+        Example:
+            >>> await sdk.set_timeout("my-experiment", 7200)
+        """
+        logger.info(f"Setting timeout for workspace {workspace_id}: {timeout}s")
+        payload = {"timeout_sec": timeout}
+        data = await self._request(
+            "PUT",
+            f"/v1/workspaces/{workspace_id}/timeout",
+            json=payload,
+        )
+        logger.info(f"Timeout updated for workspace: {workspace_id}")
+        return data
+
+    # =========================================================================
+    # Events (E2B-compatible)
+    # =========================================================================
+
+    async def get_events(
+        self,
+        workspace_id: str,
+        limit: int = 10,
+    ) -> List[SandboxEvent]:
+        """
+        Get events for a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+            limit: Maximum number of events to return (default: 10)
+
+        Returns:
+            List of SandboxEvent objects
+
+        Example:
+            >>> events = await sdk.get_events("my-experiment")
+            >>> for event in events:
+            ...     print(event.type, event.timestamp)
+        """
+        logger.debug(f"Getting events for workspace: {workspace_id}")
+        params = {"limit": limit}
+        data = await self._request(
+            "GET",
+            f"/v1/workspaces/{workspace_id}/events",
+            params=params,
+        )
+        return [SandboxEvent(**item) for item in data]
+
+    async def get_all_events(self, limit: int = 100) -> List[SandboxEvent]:
+        """
+        Get all events (admin endpoint).
+
+        Args:
+            limit: Maximum number of events to return (default: 100)
+
+        Returns:
+            List of all SandboxEvent objects
+
+        Example:
+            >>> events = await sdk.get_all_events()
+            >>> print(f"Total events: {len(events)}")
+        """
+        logger.debug(f"Getting all events (limit={limit})")
+        params = {"limit": limit}
+        data = await self._request(
+            "GET",
+            "/v1/events",
+            params=params,
+        )
+        return [SandboxEvent(**item) for item in data]
+
+    # =========================================================================
+    # Metrics (E2B-compatible)
+    # =========================================================================
+
+    async def get_metrics(self, workspace_id: str) -> List[SandboxMetrics]:
+        """
+        Get metrics for a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Returns:
+            List of SandboxMetrics objects with CPU and memory metrics
+
+        Example:
+            >>> metrics = await sdk.get_metrics("my-experiment")
+            >>> for m in metrics:
+            ...     print(f"CPU: {m.cpu_used_pct}%, Memory: {m.mem_used_mib}MiB")
+        """
+        logger.debug(f"Getting metrics for workspace: {workspace_id}")
+        data = await self._request("GET", f"/v1/workspaces/{workspace_id}/metrics")
+        return [SandboxMetrics(**item) for item in data.get("metrics", [])]
+
+    async def get_system_metrics(self) -> List[SandboxMetrics]:
+        """
+        Get all system metrics across all workspaces.
+
+        Returns:
+            List of all SandboxMetrics objects
+
+        Example:
+            >>> all_metrics = await sdk.get_system_metrics()
+            >>> print(f"Total metrics: {len(all_metrics)}")
+        """
+        logger.debug("Getting system metrics")
+        data = await self._request("GET", "/v1/metrics/system")
+        return [SandboxMetrics(**item) for item in data]
 
     # =========================================================================
     # Dataset Management
@@ -504,6 +749,74 @@ class SandboxSDK:
                 isolation_level=mode,
                 duration_ms=0,
             )
+
+    async def execute_async(
+        self,
+        workspace_id: str,
+        code: str,
+        timeout_sec: int = 3600,
+        mode: str = "safe",
+        datasets: Optional[List[str]] = None,
+        env_vars: Optional[Dict[str, str]] = None,
+    ) -> ExecutionResult:
+        """
+        Execute code asynchronously - starts execution and returns immediately.
+
+        This method starts code execution and returns immediately without waiting
+        for completion. Use get_execution_status() to poll for status and
+        get_execution_result() to get the final result.
+
+        Args:
+            workspace_id: Workspace identifier
+            code: Python code to execute
+            timeout_sec: Timeout in seconds (default: 3600)
+            mode: Execution mode - "safe", "fast", or "secure" (default: "safe")
+            datasets: List of datasets to prepare before execution
+            env_vars: Environment variables to set in the sandbox
+
+        Returns:
+            ExecutionResult object with execution_id (not waiting for completion)
+
+        Example:
+            >>> result = await sdk.execute_async(
+            ...     workspace_id="my-experiment",
+            ...     code="print('Hello, World!')"
+            ... )
+            >>> print(result.execution_id)
+            exec-abc123
+        """
+        payload = {
+            "code": code,
+            "mode": mode,
+            "timeout_sec": timeout_sec,
+            "datasets": datasets or [],
+            "env_vars": env_vars or {},
+        }
+
+        logger.info(f"Starting async execution in workspace: {workspace_id}, mode: {mode}")
+
+        # Start execution
+        response = await self._request(
+            "POST",
+            f"/v1/workspaces/{workspace_id}/run",
+            json=payload,
+        )
+
+        execution_id = response["execution_id"]
+        logger.info(f"Async execution started: {execution_id}")
+
+        # Return result indicating execution was started (not completed)
+        return ExecutionResult(
+            success=True,
+            stdout="",
+            stderr="",
+            execution_id=execution_id,
+            workspace_id=workspace_id,
+            backend="",
+            isolation_level=mode,
+            duration_ms=0,
+            metadata={"status": "started"},
+        )
 
     async def _wait_for_completion(
         self,
@@ -745,14 +1058,71 @@ class SandboxSDK:
         """
         return asyncio.run(self.get_workspace(workspace_id))
 
-    def list_workspaces_sync(self) -> List[Workspace]:
+    def list_workspaces_sync(self, state: Optional[str] = None) -> List[Workspace]:
         """
         Synchronous wrapper for list_workspaces.
+
+        Args:
+            state: Optional filter by state
 
         Returns:
             List of Workspace objects
         """
-        return asyncio.run(self.list_workspaces())
+        return asyncio.run(self.list_workspaces(state=state))
+
+    def pause_workspace_sync(self, workspace_id: str) -> PausedWorkspace:
+        """
+        Synchronous wrapper for pause_workspace.
+
+        Args:
+            Same as pause_workspace()
+
+        Returns:
+            PausedWorkspace object
+        """
+        return asyncio.run(self.pause_workspace(workspace_id))
+
+    def resume_workspace_sync(self, workspace_id: str) -> Workspace:
+        """
+        Synchronous wrapper for resume_workspace.
+
+        Args:
+            Same as resume_workspace()
+
+        Returns:
+            Workspace object
+        """
+        return asyncio.run(self.resume_workspace(workspace_id))
+
+    def get_paused_workspace_sync(self, workspace_id: str) -> PausedWorkspace:
+        """
+        Synchronous wrapper for get_paused_workspace.
+
+        Args:
+            Same as get_paused_workspace()
+
+        Returns:
+            PausedWorkspace object
+        """
+        return asyncio.run(self.get_paused_workspace(workspace_id))
+
+    def list_paused_workspaces_sync(self) -> List[PausedWorkspace]:
+        """
+        Synchronous wrapper for list_paused_workspaces.
+
+        Returns:
+            List of PausedWorkspace objects
+        """
+        return asyncio.run(self.list_paused_workspaces())
+
+    def delete_paused_workspace_sync(self, workspace_id: str) -> None:
+        """
+        Synchronous wrapper for delete_paused_workspace.
+
+        Args:
+            Same as delete_paused_workspace()
+        """
+        asyncio.run(self.delete_paused_workspace(workspace_id))
 
     def delete_workspace_sync(self, workspace_id: str) -> None:
         """
@@ -762,6 +1132,30 @@ class SandboxSDK:
             Same as delete_workspace()
         """
         asyncio.run(self.delete_workspace(workspace_id))
+
+    def get_sandbox_info_sync(self, workspace_id: str) -> SandboxInfo:
+        """
+        Synchronous wrapper for get_sandbox_info.
+
+        Args:
+            Same as get_sandbox_info()
+
+        Returns:
+            SandboxInfo object
+        """
+        return asyncio.run(self.get_sandbox_info(workspace_id))
+
+    def set_timeout_sync(self, workspace_id: str, timeout: int) -> Dict[str, Any]:
+        """
+        Synchronous wrapper for set_timeout.
+
+        Args:
+            Same as set_timeout()
+
+        Returns:
+            Response dict
+        """
+        return asyncio.run(self.set_timeout(workspace_id, timeout))
 
     def list_datasets_sync(self) -> List[DatasetInfo]:
         """
@@ -844,6 +1238,196 @@ class SandboxSDK:
         return asyncio.run(
             self.get_execution_logs(workspace_id, execution_id, offset, limit)
         )
+
+    def get_events_sync(
+        self,
+        workspace_id: str,
+        limit: int = 10,
+    ) -> List[SandboxEvent]:
+        """
+        Synchronous wrapper for get_events.
+
+        Args:
+            Same as get_events()
+
+        Returns:
+            List of SandboxEvent objects
+        """
+        return asyncio.run(self.get_events(workspace_id, limit))
+
+    def get_all_events_sync(self, limit: int = 100) -> List[SandboxEvent]:
+        """
+        Synchronous wrapper for get_all_events.
+
+        Args:
+            Same as get_all_events()
+
+        Returns:
+            List of SandboxEvent objects
+        """
+        return asyncio.run(self.get_all_events(limit))
+
+    def get_metrics_sync(self, workspace_id: str) -> List[SandboxMetrics]:
+        """
+        Synchronous wrapper for get_metrics.
+
+        Args:
+            workspace_id: Workspace identifier
+
+        Returns:
+            List of SandboxMetrics objects
+        """
+        return asyncio.run(self.get_metrics(workspace_id))
+
+    def get_system_metrics_sync(self) -> List[SandboxMetrics]:
+        """
+        Synchronous wrapper for get_system_metrics.
+
+        Returns:
+            List of all SandboxMetrics objects
+        """
+        return asyncio.run(self.get_system_metrics())
+
+    # =========================================================================
+    # Template Management
+    # =========================================================================
+
+    async def build_template(
+        self,
+        template: Template,
+        alias: Optional[str] = None,
+        wait_timeout: int = 60,
+        debug: bool = False,
+    ) -> Template:
+        """
+        Build a new template.
+
+        Args:
+            template: Template configuration
+            alias: Primary alias for the template
+            wait_timeout: Wait timeout in seconds
+            debug: Enable debug mode
+
+        Returns:
+            Template object with details
+
+        Example:
+            >>> from ds_sandbox.template import TemplateBuilder
+            >>> template = TemplateBuilder().from_python_image("3.11").build("my-template")
+            >>> result = await sdk.build_template(template)
+            >>> print(result.id)
+            my-template
+        """
+        payload = {
+            "template": template.model_dump(),
+            "alias": alias,
+            "wait_timeout": wait_timeout,
+            "debug": debug,
+        }
+
+        logger.info(f"Building template: {template.id}")
+        data = await self._request("POST", "/v1/templates", json=payload)
+        template_result = Template(**data["template"])
+        logger.info(f"Template built: {template_result.id}")
+        return template_result
+
+    async def list_templates(self) -> List[Template]:
+        """
+        List all available templates.
+
+        Returns:
+            List of Template objects
+
+        Example:
+            >>> templates = await sdk.list_templates()
+            >>> for t in templates:
+            ...     print(f"{t.id}: {t.name}")
+        """
+        logger.debug("Listing templates")
+        data = await self._request("GET", "/v1/templates")
+        return [Template(**item) for item in data.get("templates", [])]
+
+    async def get_template(self, template_id: str) -> Template:
+        """
+        Get template by ID or alias.
+
+        Args:
+            template_id: Template ID or alias
+
+        Returns:
+            Template object
+
+        Example:
+            >>> template = await sdk.get_template("my-template")
+            >>> print(template.image)
+        """
+        logger.debug(f"Getting template: {template_id}")
+        data = await self._request("GET", f"/v1/templates/{template_id}")
+        return Template(**data["template"])
+
+    async def delete_template(self, template_id: str) -> None:
+        """
+        Delete a template.
+
+        Args:
+            template_id: Template ID to delete
+
+        Example:
+            >>> await sdk.delete_template("my-template")
+        """
+        logger.info(f"Deleting template: {template_id}")
+        await self._request("DELETE", f"/v1/templates/{template_id}")
+        logger.info(f"Template deleted: {template_id}")
+
+    def build_template_sync(
+        self,
+        template: Template,
+        alias: Optional[str] = None,
+        wait_timeout: int = 60,
+        debug: bool = False,
+    ) -> Template:
+        """
+        Synchronous wrapper for build_template.
+
+        Args:
+            Same as build_template()
+
+        Returns:
+            Template object
+        """
+        return asyncio.run(
+            self.build_template(template, alias, wait_timeout, debug)
+        )
+
+    def list_templates_sync(self) -> List[Template]:
+        """
+        Synchronous wrapper for list_templates.
+
+        Returns:
+            List of Template objects
+        """
+        return asyncio.run(self.list_templates())
+
+    def get_template_sync(self, template_id: str) -> Template:
+        """
+        Synchronous wrapper for get_template.
+
+        Args:
+            Same as get_template()
+
+        Returns:
+            Template object
+        """
+        return asyncio.run(self.get_template(template_id))
+
+    def delete_template_sync(self, template_id: str) -> None:
+        """
+        Synchronous wrapper for delete_template.
+
+        Args:
+            Same as delete_template()
+        """
+        return asyncio.run(self.delete_template(template_id))
 
 
 class ExecutionLogs(BaseModel):

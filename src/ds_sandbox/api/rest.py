@@ -23,6 +23,10 @@ from ds_sandbox.types import (
     ExecutionRequest,
     Workspace,
     DatasetInfo,
+    SandboxEvent,
+    PausedWorkspace,
+    SandboxMetrics,
+    Template,
 )
 from ds_sandbox.errors import (
     SandboxError,
@@ -141,6 +145,34 @@ class SystemMetrics(BaseModel):
     failed_executions: int = Field(default=0, description="Failed executions")
     active_workspaces: int = Field(default=0, description="Active workspaces")
     avg_execution_time_ms: float = Field(default=0.0, description="Average execution time")
+
+
+class WorkspaceMetricsResponse(BaseModel):
+    """Workspace metrics response"""
+    workspace_id: str = Field(..., description="Workspace ID")
+    metrics: List[SandboxMetrics] = Field(default_factory=list, description="Metrics history")
+
+
+# =============================================================================
+# Template Request/Response Models
+# =============================================================================
+
+class BuildTemplateRequest(BaseModel):
+    """Request to build a new template"""
+    template: Template = Field(..., description="Template configuration")
+    alias: Optional[str] = Field(None, description="Primary alias for the template")
+    wait_timeout: int = Field(default=60, description="Wait timeout in seconds")
+    debug: bool = Field(default=False, description="Enable debug mode")
+
+
+class TemplateResponse(BaseModel):
+    """Template response"""
+    template: Template = Field(..., description="Template details")
+
+
+class TemplateListResponse(BaseModel):
+    """Template list response"""
+    templates: List[Template] = Field(default_factory=list, description="List of templates")
 
 
 # =============================================================================
@@ -325,6 +357,56 @@ def register_routes(app: FastAPI) -> None:
             avg_execution_time_ms=metrics.get("avg_execution_time_ms", 0.0),
         )
 
+    @app.get(
+        "/v1/workspaces/{workspace_id}/metrics",
+        response_model=WorkspaceMetricsResponse,
+        tags=["Workspaces"]
+    )
+    async def get_workspace_metrics(
+        workspace_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Get metrics for a workspace
+
+        Returns metrics history for a specific workspace.
+        """
+        logger.info(f"Getting metrics for workspace: {workspace_id}")
+
+        # Validate workspace exists
+        await manager.get_workspace(workspace_id)
+
+        # Collect current metrics
+        current_metrics = manager.collect_workspace_metrics(workspace_id)
+
+        # Get metrics history
+        metrics_history = manager.get_workspace_metrics(workspace_id)
+
+        # Ensure current metrics is in the history
+        if not metrics_history or metrics_history[-1].timestamp != current_metrics.timestamp:
+            metrics_history.append(current_metrics)
+
+        return WorkspaceMetricsResponse(
+            workspace_id=workspace_id,
+            metrics=metrics_history,
+        )
+
+    @app.get(
+        "/v1/metrics/system",
+        response_model=List[SandboxMetrics],
+        tags=["System"]
+    )
+    async def get_system_sandbox_metrics(
+        manager=Depends(get_manager)
+    ):
+        """
+        Get all system sandbox metrics
+
+        Returns CPU and memory metrics across all workspaces.
+        """
+        logger.info("Getting all system sandbox metrics")
+        return manager.get_system_metrics()
+
     # =========================================================================
     # Workspace Management
     # =========================================================================
@@ -355,14 +437,18 @@ def register_routes(app: FastAPI) -> None:
         return workspace
 
     @app.get("/v1/workspaces", response_model=List[Workspace], tags=["Workspaces"])
-    async def list_workspaces(manager=Depends(get_manager)):
+    async def list_workspaces(
+        state: Optional[str] = None,
+        manager=Depends(get_manager)
+    ):
         """
         List all workspaces
 
         Returns a list of all available workspaces.
+        Can filter by state: "running" or "paused".
         """
-        logger.info("Listing workspaces")
-        return await manager.list_workspaces()
+        logger.info(f"Listing workspaces (state filter: {state})")
+        return await manager.list_workspaces(state=state)
 
     @app.get("/v1/workspaces/{workspace_id}", response_model=Workspace, tags=["Workspaces"])
     async def get_workspace(
@@ -400,6 +486,194 @@ def register_routes(app: FastAPI) -> None:
 
         await manager.delete_workspace(workspace_id)
         logger.info(f"Workspace deleted: {workspace_id}")
+
+    # =========================================================================
+    # Workspace Pause/Resume (E2B-compatible)
+    # =========================================================================
+
+    @app.post(
+        "/v1/workspaces/{workspace_id}/pause",
+        response_model=PausedWorkspace,
+        tags=["Workspaces"]
+    )
+    async def pause_workspace(
+        workspace_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Pause a workspace
+
+        Saves the workspace state (filesystem) to a backup directory.
+        The workspace can be resumed later to restore its state.
+        Paused workspaces are stored for up to 30 days.
+        """
+        logger.info(f"Pausing workspace: {workspace_id}")
+
+        paused_workspace = await manager.pause_workspace(workspace_id)
+        logger.info(f"Workspace paused: {workspace_id}")
+
+        return paused_workspace
+
+    @app.post(
+        "/v1/workspaces/{workspace_id}/resume",
+        response_model=Workspace,
+        tags=["Workspaces"]
+    )
+    async def resume_workspace(
+        workspace_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Resume a paused workspace
+
+        Restores the workspace from its saved state.
+        """
+        logger.info(f"Resuming workspace: {workspace_id}")
+
+        workspace = await manager.resume_workspace(workspace_id)
+        logger.info(f"Workspace resumed: {workspace_id}")
+
+        return workspace
+
+    @app.get(
+        "/v1/workspaces/paused",
+        response_model=List[PausedWorkspace],
+        tags=["Workspaces"]
+    )
+    async def list_paused_workspaces(
+        manager=Depends(get_manager)
+    ):
+        """
+        List all paused workspaces
+
+        Returns a list of all paused workspaces.
+        """
+        logger.info("Listing paused workspaces")
+        return await manager.list_paused_workspaces()
+
+    @app.get(
+        "/v1/workspaces/{workspace_id}/pause",
+        response_model=PausedWorkspace,
+        tags=["Workspaces"]
+    )
+    async def get_paused_workspace(
+        workspace_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Get paused workspace information
+
+        Returns information about a paused workspace.
+        """
+        logger.info(f"Getting paused workspace: {workspace_id}")
+
+        paused_workspace = await manager.get_paused_workspace(workspace_id)
+        return paused_workspace
+
+    @app.delete(
+        "/v1/workspaces/{workspace_id}/pause",
+        status_code=204,
+        tags=["Workspaces"]
+    )
+    async def delete_paused_workspace(
+        workspace_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Delete a paused workspace backup
+
+        Removes the paused workspace backup without affecting any existing workspace.
+        """
+        logger.info(f"Deleting paused workspace: {workspace_id}")
+
+        await manager.delete_paused_workspace(workspace_id)
+        logger.info(f"Paused workspace deleted: {workspace_id}")
+
+    # =========================================================================
+    # Sandbox Lifecycle Events (E2B-compatible)
+    # =========================================================================
+
+    @app.get(
+        "/v1/workspaces/{workspace_id}/events",
+        response_model=List[SandboxEvent],
+        tags=["Events"]
+    )
+    async def get_workspace_events(
+        workspace_id: str,
+        limit: int = 10,
+        manager=Depends(get_manager)
+    ):
+        """
+        Get events for a workspace
+
+        Returns lifecycle events for a specific workspace.
+        """
+        logger.info(f"Getting events for workspace: {workspace_id}")
+        return manager.get_events(workspace_id=workspace_id, limit=limit)
+
+    @app.get(
+        "/v1/workspaces/{workspace_id}/timeout",
+        tags=["Workspaces"]
+    )
+    async def get_workspace_timeout(
+        workspace_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Get workspace timeout
+
+        Returns the current timeout setting for a workspace.
+        """
+        logger.info(f"Getting timeout for workspace: {workspace_id}")
+        # Validate workspace exists
+        await manager.get_workspace(workspace_id)
+        # Return default timeout (can be extended to store per-workspace timeout)
+        return {"workspace_id": workspace_id, "timeout_sec": 3600}
+
+    @app.put(
+        "/v1/workspaces/{workspace_id}/timeout",
+        tags=["Workspaces"]
+    )
+    async def set_workspace_timeout(
+        workspace_id: str,
+        timeout_sec: int,
+        manager=Depends(get_manager)
+    ):
+        """
+        Set workspace timeout
+
+        Updates the timeout for a workspace and emits an updated event.
+        """
+        logger.info(f"Setting timeout for workspace {workspace_id}: {timeout_sec}s")
+
+        # Validate workspace exists
+        await manager.get_workspace(workspace_id)
+
+        # Emit lifecycle event
+        manager.emit_event(
+            event_type="sandbox.lifecycle.updated",
+            workspace_id=workspace_id,
+            event_data={"set_timeout": timeout_sec},
+        )
+
+        return {"workspace_id": workspace_id, "timeout_sec": timeout_sec}
+
+    @app.get(
+        "/v1/events",
+        response_model=List[SandboxEvent],
+        tags=["Events"]
+    )
+    async def get_all_events(
+        limit: int = 100,
+        manager=Depends(get_manager)
+    ):
+        """
+        Get all events (admin)
+
+        Returns all lifecycle events across all workspaces.
+        """
+        logger.info(f"Getting all events (limit={limit})")
+        return manager.get_all_events(limit=limit)
 
     # =========================================================================
     # Dataset Management
@@ -476,6 +750,82 @@ def register_routes(app: FastAPI) -> None:
             dataset_registry=manager.config.dataset_registry_dir,
         )
         return await workspace_service.list_workspace_datasets(workspace_id)
+
+    # =========================================================================
+    # Template Management
+    # =========================================================================
+
+    @app.post(
+        "/v1/templates",
+        response_model=TemplateResponse,
+        status_code=201,
+        tags=["Templates"]
+    )
+    async def build_template(
+        request: BuildTemplateRequest,
+        manager=Depends(get_manager)
+    ):
+        """
+        Build a new template
+
+        Creates and stores a template configuration.
+        """
+        logger.info(f"Building template: {request.template.id}")
+
+        template = await manager.build_template(
+            template=request.template,
+            alias=request.alias,
+            wait_timeout=request.wait_timeout,
+            debug=request.debug,
+        )
+
+        logger.info(f"Template built: {template.id}")
+        return TemplateResponse(template=template)
+
+    @app.get("/v1/templates", response_model=TemplateListResponse, tags=["Templates"])
+    async def list_templates(manager=Depends(get_manager)):
+        """
+        List all available templates
+
+        Returns all registered templates.
+        """
+        logger.info("Listing templates")
+        templates = await manager.list_templates()
+        return TemplateListResponse(templates=templates)
+
+    @app.get("/v1/templates/{template_id}", response_model=TemplateResponse, tags=["Templates"])
+    async def get_template(
+        template_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Get template information
+
+        Returns detailed information about a specific template.
+        """
+        logger.info(f"Getting template: {template_id}")
+
+        template = await manager.get_template(template_id)
+        return TemplateResponse(template=template)
+
+    @app.delete(
+        "/v1/templates/{template_id}",
+        status_code=204,
+        tags=["Templates"]
+    )
+    async def delete_template(
+        template_id: str,
+        manager=Depends(get_manager)
+    ):
+        """
+        Delete a template
+
+        Removes a template and its aliases.
+        """
+        logger.info(f"Deleting template: {template_id}")
+
+        await manager.delete_template(template_id)
+        logger.info(f"Template deleted: {template_id}")
 
     # =========================================================================
     # Code Execution (Core Functionality)

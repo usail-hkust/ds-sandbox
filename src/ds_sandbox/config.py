@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field
+from typing import List, Optional
 
 
 class SandboxConfig(BaseModel):
@@ -12,6 +13,12 @@ class SandboxConfig(BaseModel):
 
     Priority: Environment variables > Config file > Defaults
     """
+
+    # API configuration (for remote usage)
+    api_endpoint: str = Field(
+        default="",
+        description="Remote API endpoint (e.g., http://localhost:8000). If empty, use local backend."
+    )
 
     # Backend selection
     default_backend: str = Field(
@@ -41,6 +48,19 @@ class SandboxConfig(BaseModel):
         ge=1,
         le=365,
         description="Days before unused workspaces are cleaned up"
+    )
+
+    # Paused workspace storage
+    paused_workspaces_base_dir: str = Field(
+        default="/opt/paused",
+        description="Base directory for storing paused workspace states"
+    )
+
+    paused_workspace_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=90,
+        description="Days before paused workspaces are automatically cleaned up"
     )
 
     # Dataset management
@@ -122,6 +142,88 @@ class SandboxConfig(BaseModel):
         default="/var/log/ds-sandbox/audit.logl",
         description="Path to audit log file"
     )
+
+    # Default user and working directory
+    default_user: str = Field(
+        default="user",
+        description="Default user for sandbox sessions"
+    )
+
+    default_workdir: str = Field(
+        default="/home/user",
+        description="Default working directory for sandbox sessions"
+    )
+
+    # Template configuration
+    templates_dir: str = Field(
+        default="/etc/ds-sandbox/templates",
+        description="Directory containing template configurations"
+    )
+
+    @classmethod
+    def load_template(cls, template_id: str, templates_dir: Optional[str] = None) -> Optional["Template"]:
+        """
+        Load a template from the templates directory.
+
+        Args:
+            template_id: Template identifier (filename without extension)
+            templates_dir: Optional custom templates directory
+
+        Returns:
+            Template object if found, None otherwise
+        """
+        from ds_sandbox.types import Template
+        import yaml
+        import os
+
+        dir_path = templates_dir or cls().templates_dir
+        template_path = os.path.join(dir_path, f"{template_id}.yaml")
+
+        if not os.path.exists(template_path):
+            template_path = os.path.join(dir_path, f"{template_id}.yml")
+
+        if not os.path.exists(template_path):
+            return None
+
+        with open(template_path, "r") as f:
+            data = yaml.safe_load(f)
+
+        return Template(**data)
+
+    @classmethod
+    def list_templates(cls, templates_dir: Optional[str] = None) -> List[str]:
+        """
+        List available template IDs in the templates directory.
+
+        Args:
+            templates_dir: Optional custom templates directory
+
+        Returns:
+            List of template IDs
+        """
+        import os
+        import glob
+
+        dir_path = templates_dir or cls().templates_dir
+
+        if not os.path.exists(dir_path):
+            return []
+
+        # Find all yaml/yml files
+        patterns = [
+            os.path.join(dir_path, "*.yaml"),
+            os.path.join(dir_path, "*.yml"),
+        ]
+
+        template_ids = []
+        for pattern in patterns:
+            for filepath in glob.glob(pattern):
+                filename = os.path.basename(filepath)
+                # Remove extension
+                template_id = os.path.splitext(filename)[0]
+                template_ids.append(template_id)
+
+        return sorted(set(template_ids))
 
     @classmethod
     def from_env(cls) -> "SandboxConfig":
