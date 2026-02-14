@@ -15,9 +15,8 @@ from typing import Any, Dict, List, Optional, Type
 
 from ds_sandbox.backends import SandboxBackend
 from ds_sandbox.config import SandboxConfig
-from ds_sandbox.monitoring.metrics import InMemoryMetricsCollector
-from ds_sandbox.path_utils import validate_path_component
 from ds_sandbox.security.scanner import CodeScanner
+from ds_sandbox.path_utils import validate_path_component
 from ds_sandbox.errors import (
     BackendUnavailableError,
     DatasetNotFoundError,
@@ -39,6 +38,9 @@ from ds_sandbox.types import (
     Template,
     StorageConfig,
 )
+from ds_sandbox.execution.tracker import ExecutionTracker
+from ds_sandbox.execution.router import IsolationRouter
+from ds_sandbox.template_manager.manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -77,29 +79,23 @@ class SandboxManager:
         self.config = config
         self._backends: Dict[str, SandboxBackend] = {}
         self._router = IsolationRouter(config)
+        self._tracker = ExecutionTracker()
+        self._template_manager = TemplateManager(
+            Path(config.workspace_base_dir).parent / "templates"
+        )
         self._workspace_cache: Dict[str, Workspace] = {}
-        self._execution_store: Dict[str, Dict[str, Any]] = {}
-        self._metrics = InMemoryMetricsCollector()
-        self._events: List[SandboxEvent] = []
         self._paused_workspaces: Dict[str, PausedWorkspace] = {}
-        self._metrics_history: Dict[str, List[SandboxMetrics]] = {}
-        self._templates: Dict[str, Template] = {}
-        self._template_aliases: Dict[str, str] = {}  # alias -> template_id
         self._storage_mounts: Dict[str, Dict[str, StorageConfig]] = {}  # workspace_id -> {mount_name -> StorageConfig}
 
         # Ensure paused workspaces directory exists
         self._paused_dir = Path(config.paused_workspaces_base_dir)
         self._paused_dir.mkdir(parents=True, exist_ok=True)
 
-        # Ensure templates directory exists
-        self._templates_dir = Path(config.workspace_base_dir).parent / "templates"
-        self._templates_dir.mkdir(parents=True, exist_ok=True)
-
         # Load default backends
         self.load_backends_from_registry()
 
         # Load existing templates from disk
-        self._load_templates()
+        self._template_manager._load_templates()
 
         logger.info(f"SandboxManager initialized with config: default_backend={config.default_backend}")
 
@@ -235,7 +231,7 @@ class SandboxManager:
             logger.info(f"Selected backend '{backend_name}' for execution {execution_id}")
 
             # Track execution start
-            self._track_execution_start(execution_id, request.workspace_id, backend_name)
+            self._tracker._track_execution_start(execution_id, request.workspace_id, backend_name)
 
             # Step 6: Execute code
             result = await backend.execute(request, workspace)
@@ -263,7 +259,7 @@ class SandboxManager:
 
             # Track execution completion
             status = "completed" if result.success else "failed"
-            self._track_execution_complete(
+            self._tracker._track_execution_complete(
                 execution_id,
                 status,
                 stdout=result.stdout,
@@ -283,61 +279,14 @@ class SandboxManager:
                 timeout_sec=request.timeout_sec
             )
             logger.error(f"Execution {execution_id} timed out: {error}")
-            self._track_execution_complete(execution_id, "failed")
+            self._tracker._track_execution_complete(execution_id, "failed")
             raise error
         except Exception as e:
             logger.error(f"Execution {execution_id} failed: {e}", exc_info=True)
-            self._track_execution_complete(execution_id, "failed")
+            self._tracker._track_execution_complete(execution_id, "failed")
             raise ExecutionFailedError(
                 execution_id=execution_id,
                 reason=str(e)
-            )
-
-    def _track_execution_start(
-        self,
-        execution_id: str,
-        workspace_id: str,
-        backend: str,
-    ) -> None:
-        """Track the start of an execution."""
-        self._execution_store[execution_id] = {
-            "execution_id": execution_id,
-            "workspace_id": workspace_id,
-            "status": "running",
-            "backend": backend,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "completed_at": None,
-        }
-        self._metrics.record_execution_started(execution_id, workspace_id)
-
-    def _track_execution_complete(
-        self,
-        execution_id: str,
-        status: str,
-        stdout: Optional[str] = None,
-        stderr: Optional[str] = None,
-        exit_code: Optional[int] = None,
-        duration_ms: Optional[int] = None,
-    ) -> None:
-        """Track the completion of an execution."""
-        if execution_id in self._execution_store:
-            self._execution_store[execution_id]["status"] = status
-            self._execution_store[execution_id]["completed_at"] = datetime.now(
-                timezone.utc
-            ).isoformat()
-            if stdout is not None:
-                self._execution_store[execution_id]["stdout"] = stdout
-            if stderr is not None:
-                self._execution_store[execution_id]["stderr"] = stderr
-            if exit_code is not None:
-                self._execution_store[execution_id]["exit_code"] = exit_code
-            if duration_ms is not None:
-                self._execution_store[execution_id]["duration_ms"] = duration_ms
-            self._metrics.record_execution_completed(
-                execution_id,
-                status,
-                duration_ms=duration_ms,
             )
 
     async def get_execution_status(
@@ -358,10 +307,7 @@ class SandboxManager:
         Raises:
             SandboxError: If execution not found
         """
-        if execution_id not in self._execution_store:
-            raise ExecutionNotFoundError(execution_id=execution_id)
-
-        status = self._execution_store[execution_id]
+        status = self._tracker.get_execution_status(execution_id)
         # Verify workspace matches
         if status["workspace_id"] != workspace_id:
             raise ExecutionNotFoundError(execution_id=execution_id)
@@ -386,10 +332,7 @@ class SandboxManager:
         Raises:
             ExecutionNotFoundError: If execution not found
         """
-        if execution_id not in self._execution_store:
-            raise ExecutionNotFoundError(execution_id=execution_id)
-
-        status = self._execution_store[execution_id]
+        status = self._tracker.get_execution_status(execution_id)
         # Verify workspace matches
         if status["workspace_id"] != workspace_id:
             raise ExecutionNotFoundError(execution_id=execution_id)
@@ -407,7 +350,7 @@ class SandboxManager:
                 await backend.stop_execution(execution_id, workspace_id)
 
         # Update execution status
-        self._track_execution_complete(execution_id, "stopped")
+        self._tracker._track_execution_complete(execution_id, "stopped")
         logger.info(f"Execution {execution_id} stopped")
 
         return True
@@ -419,7 +362,7 @@ class SandboxManager:
         Returns:
             Dictionary with system metrics
         """
-        return self._metrics.snapshot()
+        return self._tracker.get_metrics()
 
     def get_workspace_metrics(self, workspace_id: str) -> List[SandboxMetrics]:
         """
@@ -431,7 +374,7 @@ class SandboxManager:
         Returns:
             List of SandboxMetrics objects
         """
-        return self._metrics_history.get(workspace_id, [])
+        return self._tracker.get_workspace_metrics(workspace_id)
 
     def get_system_metrics(self) -> List[SandboxMetrics]:
         """
@@ -440,12 +383,7 @@ class SandboxManager:
         Returns:
             List of all SandboxMetrics objects
         """
-        all_metrics = []
-        for metrics_list in self._metrics_history.values():
-            all_metrics.extend(metrics_list)
-        # Return sorted by timestamp
-        all_metrics.sort(key=lambda m: m.timestamp)
-        return all_metrics
+        return self._tracker.get_system_metrics()
 
     def collect_workspace_metrics(self, workspace_id: str) -> SandboxMetrics:
         """
@@ -457,42 +395,7 @@ class SandboxManager:
         Returns:
             SandboxMetrics object with current metrics
         """
-        import psutil
-
-        # Get CPU count
-        cpu_count = psutil.cpu_count() or 1
-
-        # Get CPU usage (percentage over 0.1 second interval)
-        cpu_used_pct = psutil.cpu_percent(interval=0.1)
-
-        # Get memory info
-        mem = psutil.virtual_memory()
-        mem_total_mib = int(mem.total / (1024 * 1024))
-        mem_used_mib = int(mem.used / (1024 * 1024))
-
-        # Get current timestamp
-        timestamp = datetime.now(timezone.utc).isoformat()
-
-        # Create metrics object
-        metrics = SandboxMetrics(
-            cpu_count=cpu_count,
-            cpu_used_pct=cpu_used_pct,
-            mem_total_mib=mem_total_mib,
-            mem_used_mib=mem_used_mib,
-            timestamp=timestamp,
-        )
-
-        # Store in history
-        if workspace_id not in self._metrics_history:
-            self._metrics_history[workspace_id] = []
-
-        # Keep only last 100 metrics per workspace
-        if len(self._metrics_history[workspace_id]) >= 100:
-            self._metrics_history[workspace_id] = self._metrics_history[workspace_id][-99:]
-
-        self._metrics_history[workspace_id].append(metrics)
-
-        return metrics
+        return self._tracker.collect_workspace_metrics(workspace_id)
 
     # =========================================================================
     # Event Management
@@ -515,17 +418,7 @@ class SandboxManager:
         Returns:
             The created SandboxEvent
         """
-        event = SandboxEvent(
-            id=f"evt-{uuid.uuid4().hex[:12]}",
-            type=event_type,
-            event_data=event_data or {},
-            sandbox_id=f"sandbox-{workspace_id}",
-            workspace_id=workspace_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
-        self._events.append(event)
-        logger.info(f"Event emitted: {event_type} for workspace {workspace_id}")
-        return event
+        return self._tracker.emit_event(event_type, workspace_id, event_data)
 
     def get_events(
         self,
@@ -542,13 +435,7 @@ class SandboxManager:
         Returns:
             List of SandboxEvent objects
         """
-        events = self._events
-
-        if workspace_id:
-            events = [e for e in events if e.workspace_id == workspace_id]
-
-        # Return most recent events (last N)
-        return events[-limit:] if len(events) > limit else events
+        return self._tracker.get_events(workspace_id, limit)
 
     def get_all_events(self, limit: int = 100) -> List[SandboxEvent]:
         """
@@ -560,8 +447,7 @@ class SandboxManager:
         Returns:
             List of all SandboxEvent objects
         """
-        # Return most recent events (last N)
-        return self._events[-limit:] if len(self._events) > limit else self._events
+        return self._tracker.get_all_events(limit)
 
     async def create_workspace(
         self,
@@ -652,7 +538,6 @@ class SandboxManager:
 
             # Cache workspace
             self._workspace_cache[workspace_id] = workspace
-            self._metrics.record_workspace_created(workspace_id)
 
             # Emit lifecycle event
             self.emit_event(
@@ -763,7 +648,6 @@ class SandboxManager:
             )
 
             logger.info(f"Workspace '{workspace_id}' deleted successfully")
-            self._metrics.record_workspace_deleted(workspace_id)
 
         except Exception as e:
             logger.error(f"Failed to delete workspace {workspace_id}: {e}", exc_info=True)
@@ -1456,37 +1340,6 @@ class SandboxManager:
     # Template Management
     # =========================================================================
 
-    def _load_templates(self) -> None:
-        """Load templates from disk"""
-        import json
-
-        if not self._templates_dir.exists():
-            return
-
-        for template_file in self._templates_dir.glob("*.json"):
-            try:
-                with open(template_file, "r") as f:
-                    template_data = json.load(f)
-                    template = Template(**template_data)
-                    self._templates[template.id] = template
-
-                    # Register aliases
-                    for alias in template.aliases:
-                        self._template_aliases[alias] = template.id
-
-                    logger.debug(f"Loaded template: {template.id}")
-            except Exception as e:
-                logger.warning(f"Failed to load template from {template_file}: {e}")
-
-    def _save_template(self, template: Template) -> None:
-        """Save template to disk"""
-        import json
-
-        template_file = self._templates_dir / f"{template.id}.json"
-        with open(template_file, "w") as f:
-            json.dump(template.model_dump(), f, indent=2)
-        logger.debug(f"Saved template: {template.id}")
-
     async def build_template(
         self,
         template: Template,
@@ -1518,20 +1371,9 @@ class SandboxManager:
             >>> manager = SandboxManager()
             >>> result = await manager.build_template(template)
         """
-        # Set alias if provided
-        if alias:
-            if alias not in template.aliases:
-                template.aliases.insert(0, alias)
-
-        # Store template in memory
-        self._templates[template.id] = template
-
-        # Register aliases
-        for template_alias in template.aliases:
-            self._template_aliases[template_alias] = template.id
-
-        # Save to disk
-        self._save_template(template)
+        result = await self._template_manager.build_template(
+            template, alias, wait_timeout, debug
+        )
 
         # Emit lifecycle event
         self.emit_event(
@@ -1546,7 +1388,7 @@ class SandboxManager:
         )
 
         logger.info(f"Template built: {template.id}")
-        return template
+        return result
 
     async def list_templates(self) -> List[Template]:
         """
@@ -1560,7 +1402,7 @@ class SandboxManager:
             >>> for t in templates:
             ...     print(f"{t.id}: {t.name}")
         """
-        return list(self._templates.values())
+        return await self._template_manager.list_templates()
 
     async def get_template(self, template_id: str) -> Template:
         """
@@ -1575,19 +1417,7 @@ class SandboxManager:
         Raises:
             SandboxError: If template not found
         """
-        # Try direct ID first
-        if template_id in self._templates:
-            return self._templates[template_id]
-
-        # Try alias lookup
-        if template_id in self._template_aliases:
-            actual_id = self._template_aliases[template_id]
-            return self._templates[actual_id]
-
-        raise SandboxError(
-            message=f"Template not found: {template_id}",
-            error_code="TEMPLATE_NOT_FOUND",
-        )
+        return await self._template_manager.get_template(template_id)
 
     async def delete_template(self, template_id: str) -> None:
         """
@@ -1599,20 +1429,7 @@ class SandboxManager:
         Raises:
             SandboxError: If template not found
         """
-        # Get template to remove aliases
-        template = await self.get_template(template_id)
-
-        # Remove from memory
-        del self._templates[template_id]
-
-        # Remove aliases
-        for alias in template.aliases:
-            self._template_aliases.pop(alias, None)
-
-        # Remove from disk
-        template_file = self._templates_dir / f"{template_id}.json"
-        if template_file.exists():
-            template_file.unlink()
+        await self._template_manager.delete_template(template_id)
 
         # Emit lifecycle event
         self.emit_event(
@@ -1622,186 +1439,3 @@ class SandboxManager:
         )
 
         logger.info(f"Template deleted: {template_id}")
-
-
-class IsolationRouter:
-    """
-    Isolation level router - decides which backend to use.
-
-    Routing logic:
-    1. Explicit backend selection via config.default_backend=local
-    2. GPU or restricted network access → Docker
-    3. Code risk score → auto routing
-    4. Default → config.default_backend (with auto fallback to Docker)
-    """
-
-    # Mapping from mode to backend
-    MODE_BACKEND_MAP = {
-        "secure": "docker",
-        "fast": "docker",
-        "safe": "docker",
-    }
-
-    # Risk score thresholds
-    HIGH_RISK_THRESHOLD = 0.7
-    MEDIUM_RISK_THRESHOLD = 0.3
-
-    def __init__(self, config: SandboxConfig):
-        """
-        Initialize isolation router.
-
-        Args:
-            config: Sandbox configuration
-        """
-        self.config = config
-
-    def decide_backend(
-        self,
-        request: ExecutionRequest,
-        code_scan_result: Optional[CodeScanResult] = None,
-    ) -> str:
-        """
-        Decide which backend to use for execution.
-
-        Args:
-            request: Execution request with all parameters
-            code_scan_result: Optional code security scan result
-
-        Returns:
-            Backend name to use (docker, firecracker, kata, etc.)
-        """
-        # Step 0: Manual override for local backend.
-        # local backend is never selected automatically; users must opt in
-        # by setting default_backend=local in config.
-        if self.config.default_backend == "local":
-            if request.enable_gpu:
-                logger.debug("GPU requested, forcing docker backend instead of local")
-                return "docker"
-            if request.network_policy in ("whitelist", "proxy"):
-                logger.debug(
-                    "Restricted network policy requested, forcing docker backend instead of local"
-                )
-                return "docker"
-            return "local"
-
-        # Step 1: Check for secure requirements
-        # Note: GPU and network isolation require firecracker, but we only have docker now
-        # Fall back to docker until firecracker is implemented
-        if request.enable_gpu:
-            logger.debug("GPU requested, using docker backend (firecracker TBD)")
-            return "docker"
-
-        # Step 2: Check network policy
-        if request.network_policy in ("whitelist", "proxy"):
-            logger.debug(f"Network policy '{request.network_policy}' using docker backend (firecracker TBD)")
-            return "docker"
-
-        # Step 3: Route based on execution mode
-        mode = request.mode.lower()
-        if mode in self.MODE_BACKEND_MAP:
-            mapped_backend = self.MODE_BACKEND_MAP[mode]
-            if mapped_backend != "auto":
-                return mapped_backend
-
-        # Step 4: Route based on code scan result if provided
-        if code_scan_result is not None:
-            if code_scan_result.risk_score >= self.HIGH_RISK_THRESHOLD:
-                logger.debug(
-                    f"High risk code (score={code_scan_result.risk_score}), "
-                    "using docker backend (firecracker TBD)"
-                )
-                return "docker"
-            elif code_scan_result.risk_score >= self.MEDIUM_RISK_THRESHOLD:
-                logger.debug(
-                    f"Medium risk code (score={code_scan_result.risk_score}), "
-                    "using docker backend"
-                )
-                return "docker"
-
-        # Step 5: Use default backend from config
-        if self.config.default_backend == "auto":
-            return "docker"
-
-        return self.config.default_backend
-
-    def _validate_request(self, request: ExecutionRequest) -> None:
-        """
-        Validate execution request parameters.
-
-        Args:
-            request: Execution request to validate
-
-        Raises:
-            InvalidRequestError: If request is invalid
-        """
-        # Validate code is not empty
-        if not request.code or not request.code.strip():
-            raise InvalidRequestError(
-                field="code",
-                value=None,
-                reason="Code cannot be empty",
-            )
-
-        # Validate workspace_id
-        if not request.workspace_id:
-            raise InvalidRequestError(
-                field="workspace_id",
-                value=None,
-                reason="Workspace ID is required",
-            )
-
-        # Validate workspace_id format
-        if len(request.workspace_id) < 1 or len(request.workspace_id) > 64:
-            raise InvalidRequestError(
-                field="workspace_id",
-                value=request.workspace_id,
-                reason="Workspace ID must be between 1 and 64 characters",
-            )
-
-        # Validate timeout
-        if request.timeout_sec < 1 or request.timeout_sec > 86400:
-            raise InvalidRequestError(
-                field="timeout_sec",
-                value=request.timeout_sec,
-                reason="Timeout must be between 1 and 86400 seconds",
-            )
-
-        # Validate memory
-        if request.memory_mb < 512 or request.memory_mb > 65536:
-            raise InvalidRequestError(
-                field="memory_mb",
-                value=request.memory_mb,
-                reason="Memory must be between 512 and 65536 MB",
-            )
-
-        # Validate CPU cores
-        if request.cpu_cores < 0.5 or request.cpu_cores > 16.0:
-            raise InvalidRequestError(
-                field="cpu_cores",
-                value=request.cpu_cores,
-                reason="CPU cores must be between 0.5 and 16.0",
-            )
-
-        # Validate network whitelist if policy is whitelist
-        if request.network_policy == "whitelist" and not request.network_whitelist:
-            logger.warning(
-                "Network policy is 'whitelist' but no whitelist entries provided. "
-                "Network access will be blocked."
-            )
-
-    def get_supported_backends(self) -> List[str]:
-        """
-        Get list of supported backend names.
-
-        Returns:
-            List of backend name strings
-        """
-        backends = list(dict.fromkeys(self.MODE_BACKEND_MAP.values()))
-
-        if "local" not in backends:
-            backends.append("local")
-
-        if self.config.default_backend != "auto" and self.config.default_backend not in backends:
-            backends.append(self.config.default_backend)
-
-        return backends
