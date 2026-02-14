@@ -28,7 +28,7 @@ from ds_sandbox.api.rest import create_app, app, SandboxErrorResponse
 from ds_sandbox.api.sdk import SandboxSDK, ExecutionStatus, ExecutionLogs
 
 # E2B-compatible Sandbox class
-from ds_sandbox.sandbox import Sandbox
+from ds_sandbox.sandbox.sandbox import Sandbox
 
 # E2B-compatible exception classes
 from ds_sandbox.errors import (
