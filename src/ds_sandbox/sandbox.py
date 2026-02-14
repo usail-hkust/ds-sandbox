@@ -371,7 +371,22 @@ class Files:
 
         return created_paths
 
-    async def watch_dir(
+    def watch_dir(
+        self,
+        path: str,
+        callback: Callable[[Dict[str, Any]], None],
+        recursive: bool = False,
+    ) -> None:
+        """Watch a directory for changes synchronously (E2B-compatible).
+
+        Args:
+            path: Directory path to watch in the sandbox.
+            callback: Callback function called on file changes.
+            recursive: Whether to watch subdirectories recursively.
+        """
+        return asyncio.run(self._watch_dir_async(path, callback, recursive))
+
+    async def _watch_dir_async(
         self,
         path: str,
         callback: Callable[[Dict[str, Any]], None],
