@@ -32,15 +32,24 @@ class Files:
         """Initialize with parent sandbox."""
         self._sandbox = sandbox
 
-    def write(self, path: str, content: Union[bytes, str]) -> str:
-        """Write content to a file synchronously (E2B-compatible).
+    def write(
+        self,
+        path: Union[str, List[Dict[str, Any]]],
+        content: Optional[Union[bytes, str]] = None
+    ) -> Union[str, List[str]]:
+        """Write content to a file(s) synchronously (E2B-compatible).
 
         Args:
-            path: Destination path in the sandbox.
-            content: File content as bytes or string
+            path: Destination path in the sandbox, or a list of file dicts.
+                  When a list is provided, each dict should have 'path' and 'data' keys.
+                  Examples:
+                    - "/home/user/data.csv" -> {workspace}/home/user/data.csv
+                    - "data.csv" -> {workspace}/data.csv
+                    - [{'path': '/a.txt', 'data': 'content'}, ...] -> multiple files
+            content: File content as bytes or string (only used when path is a string)
 
         Returns:
-            The path where the file was saved
+            The path where the file was saved, or a list of created paths
         """
         return asyncio.run(self._write_async(path, content))
 
@@ -56,35 +65,54 @@ class Files:
         """
         return self.write(path, content)
 
-    async def _write_async(self, path: str, content: Union[bytes, str]) -> str:
-        """Write content to a file asynchronously.
+    async def _write_async(
+        self,
+        path: Union[str, List[Dict[str, Any]]],
+        content: Optional[Union[bytes, str]] = None
+    ) -> Union[str, List[str]]:
+        """Write content to a file(s) asynchronously.
 
         Args:
-            path: Destination path in the sandbox.
-                  Examples:
-                    - "/home/user/data.csv" -> {workspace}/home/user/data.csv
-                    - "data.csv" -> {workspace}/data.csv
-            content: File content as bytes or string
+            path: Destination path in the sandbox, or a list of file dicts.
+                  When a list is provided, each dict should have 'path' and 'data' keys.
+            content: File content as bytes or string (only used when path is a string)
 
         Returns:
-            The path where the file was saved
+            The path where the file was saved, or a list of created paths
         """
         workspace = self._sandbox.workspace
         if not workspace:
             raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
 
-        # 直接将用户传入的路径拼接到 workspace 目录下
-        # /home/user/data.csv -> {workspace}/home/user/data.csv
-        # data.csv -> {workspace}/data.csv
+        # Handle multiple files (array format)
+        if isinstance(path, list):
+            created_paths = []
+            for file_spec in path:
+                if not isinstance(file_spec, dict) or 'path' not in file_spec or 'data' not in file_spec:
+                    raise ValueError("Each file spec must be a dict with 'path' and 'data' keys")
+                file_path = file_spec['path']
+                file_data = file_spec['data']
+                rel_path = file_path.lstrip("/")
+                host_path = Path(workspace.host_path) / rel_path
+                host_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if isinstance(file_data, str):
+                    host_path.write_text(file_data, encoding="utf-8")
+                else:
+                    host_path.write_bytes(file_data)
+
+                created_paths.append(file_path)
+                logger.debug(f"Wrote file to {host_path}")
+            return created_paths
+
+        # Handle single file (original behavior)
+        if content is None:
+            raise ValueError("content parameter is required when path is a string")
+
         rel_path = path.lstrip("/")
-
-        # 构建实际的主机路径
         host_path = Path(workspace.host_path) / rel_path
-
-        # 创建父目录（如果不存在）
         host_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 写入内容
         if isinstance(content, str):
             host_path.write_text(content, encoding="utf-8")
         else:
@@ -392,6 +420,95 @@ class Files:
             self._watch_observer = observer
         except ImportError:
             logger.warning("watchdog not installed, watch_dir will not function")
+
+    def upload(self, local_path: str, remote_path: str) -> str:
+        """Upload a local file to the sandbox (E2B-compatible).
+
+        Args:
+            local_path: Path to local file
+            remote_path: Destination path in sandbox
+
+        Returns:
+            The remote path where file was saved
+        """
+        return asyncio.run(self._upload_async(local_path, remote_path))
+
+    async def _upload_async(self, local_path: str, remote_path: str) -> str:
+        """Upload a local file to the sandbox asynchronously.
+
+        Args:
+            local_path: Path to local file
+            remote_path: Destination path in sandbox
+
+        Returns:
+            The remote path where file was saved
+        """
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        local_path_obj = Path(local_path)
+        if not local_path_obj.exists():
+            raise FileNotFoundError(f"Local file not found: {local_path}")
+
+        if not local_path_obj.is_file():
+            raise ValueError(f"Local path is not a file: {local_path}")
+
+        rel_path = remote_path.lstrip("/")
+        host_path = Path(workspace.host_path) / rel_path
+        host_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Copy file content
+        import shutil
+        shutil.copy2(local_path_obj, host_path)
+
+        logger.debug(f"Uploaded file to {host_path}")
+        return remote_path
+
+    def download(self, remote_path: str, local_path: str) -> str:
+        """Download a file from sandbox to local (E2B-compatible).
+
+        Args:
+            remote_path: Path to file in sandbox
+            local_path: Destination local path
+
+        Returns:
+            The local path where file was saved
+        """
+        return asyncio.run(self._download_async(remote_path, local_path))
+
+    async def _download_async(self, remote_path: str, local_path: str) -> str:
+        """Download a file from sandbox to local asynchronously.
+
+        Args:
+            remote_path: Path to file in sandbox
+            local_path: Destination local path
+
+        Returns:
+            The local path where file was saved
+        """
+        workspace = self._sandbox.workspace
+        if not workspace:
+            raise RuntimeError("Sandbox not initialized. Call await sandbox.create() first.")
+
+        rel_path = remote_path.lstrip("/")
+        host_path = Path(workspace.host_path) / rel_path
+
+        if not host_path.exists():
+            raise FileNotFoundError(f"File not found in sandbox: {remote_path}")
+
+        if not host_path.is_file():
+            raise ValueError(f"Path is not a file in sandbox: {remote_path}")
+
+        local_path_obj = Path(local_path)
+        local_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+        # Copy file content
+        import shutil
+        shutil.copy2(host_path, local_path_obj)
+
+        logger.debug(f"Downloaded file to {local_path}")
+        return local_path
 
 
 class Commands:
